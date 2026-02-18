@@ -69,6 +69,12 @@ A small language-modeling variant with a causal rollout over agent index. Within
 python language_experiment.py
 ```
 
+Efficient causal implementation (same objective, less repeated encoding work per step):
+
+```bash
+python language_experiment_efficient.py
+```
+
 Useful flags:
 
 ```bash
