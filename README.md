@@ -63,7 +63,7 @@ conda run -n emergent-multiagent python experiment.py
 
 ## Language experiment
 
-A small language-modeling variant with an RNN-style alignment: agent i sees token t_i and predicts token t_{i+1} within a sampled window of length agents+1. Observer agents receive their token; non-observers get zero input but still predict for evaluation. Sentences must be long enough for the chosen number of agents.
+A small language-modeling variant with an RNN-style alignment: agent i sees token t_i and predicts token t_{i+1} within a sampled window of length agents+1. Observer agents receive their token; non-observers get zero input but still predict for evaluation. Sentences must be long enough for the chosen number of agents (or use --sequence-mode stream to concatenate).
 
 ```bash
 conda run -n emergent-multiagent python language_experiment.py
@@ -80,6 +80,7 @@ Useful flags:
 --batch-size 32
 --epochs 100
 --steps-per-epoch 200
+--sequence-mode stream|sentence
 ```
 
 Additional dataset options (requires torchtext for real datasets):

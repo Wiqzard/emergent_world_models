@@ -250,6 +250,7 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--corpus-file", type=str, default=None)
     parser.add_argument("--dataset", type=str, default="toy", choices=["toy", "wikitext2", "ptb"])
+    parser.add_argument("--sequence-mode", type=str, default="stream", choices=["stream", "sentence"])
     parser.add_argument("--dataset-root", type=str, default=None)
     parser.add_argument("--dataset-split", type=str, default="train")
     args = parser.parse_args()
@@ -279,10 +280,18 @@ def main() -> None:
     seqs = encode_sentences(sentences, stoi)
     vocab_size = len(vocab)
 
+    if args.sequence_mode == "stream":
+        stream = []
+        for s in seqs:
+            stream.extend(s)
+        seqs_for_sampling = [stream]
+    else:
+        seqs_for_sampling = seqs
+
     window_len = args.agents + 1
-    valid_seqs = [s for s in seqs if len(s) >= window_len]
+    valid_seqs = [s for s in seqs_for_sampling if len(s) >= window_len]
     if not valid_seqs:
-        raise ValueError("No sequences long enough for the number of agents. Provide longer sentences or reduce --agents.")
+        raise ValueError("No sequences long enough for the number of agents. Provide longer sentences, use --sequence-mode stream, or reduce --agents.")
 
     k_neighbors = args.neighbors if args.neighbors is not None else args.degree
     graph = build_graph(args.agents, args.graph, k_neighbors)
