@@ -307,6 +307,7 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--compile", type=str, default="auto", choices=["auto", "on", "off"])
     parser.add_argument("--amp", type=str, default="auto", choices=["auto", "on", "off"])
+    parser.add_argument("--eval-batches", type=int, default=8)
     parser.add_argument("--corpus-file", type=str, default=None)
     parser.add_argument("--dataset", type=str, default="toy", choices=["toy", "wikitext2", "ptb"])
     parser.add_argument("--sequence-mode", type=str, default="stream", choices=["stream", "sentence"])
@@ -318,6 +319,8 @@ def main() -> None:
         raise ValueError("--agents must be >= 2 for neighbor-state prediction")
     if args.unroll_steps < 1:
         raise ValueError("--unroll-steps must be >= 1")
+    if args.eval_batches < 0:
+        raise ValueError("--eval-batches must be >= 0")
     if args.observer_agent < 0 or args.observer_agent >= args.agents:
         raise ValueError("--observer-agent must be in [0, agents-1]")
 
@@ -426,6 +429,7 @@ def main() -> None:
     if args.graph not in {"full", "ring", "line", "grid", "star"}:
         print("Neighbors per agent:", k_neighbors)
     print("Unroll steps:", args.unroll_steps)
+    print("Eval batches (autoregressive):", args.eval_batches)
     print("Model overview:")
     print("  Shared agent weights across all positions")
     print("  Per-agent learned identity embedding added to state features")
@@ -443,6 +447,54 @@ def main() -> None:
 
     agent_ids_t = torch.arange(args.agents, device=device, dtype=torch.long)
     observer_id_t = torch.as_tensor([args.observer_agent], device=device, dtype=torch.long)
+
+    def autoregressive_token_eval() -> Tuple[float, float]:
+        if args.eval_batches == 0:
+            return float("nan"), float("nan")
+
+        shared_agent.eval()
+        total_ce = 0.0
+        total_correct = 0
+        total_tokens = 0
+
+        with torch.no_grad():
+            for _ in range(args.eval_batches):
+                windows = sample_windows(valid_seqs, args.batch_size, window_len)
+                tokens = torch.as_tensor(windows, dtype=torch.long, device=device)  # [B, T+1]
+
+                with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.float16):
+                    zero_state = shared_agent.encode_zero(args.batch_size, device)  # [B, D]
+                    base_inputs = zero_state.unsqueeze(0).expand(args.agents, -1, -1)  # [A, B, D]
+                    prev_states = torch.zeros((args.agents, args.batch_size, args.state_dim), device=device)
+
+                    input_t0 = base_inputs.clone()
+                    input_t0[args.observer_agent] = shared_agent.encode_tokens(tokens[:, 0])
+                    prev_neighbors = gather_neighbor_states(prev_states, neighbor_idx_t, neighbor_mask_t)
+                    curr_states = shared_agent.form_states(input_t0, prev_neighbors, agent_ids_t)
+
+                    for t in range(args.unroll_steps):
+                        curr_neighbors = gather_neighbor_states(curr_states, neighbor_idx_t, neighbor_mask_t)
+                        obs_state = curr_states[args.observer_agent : args.observer_agent + 1]
+                        obs_neighbors = curr_neighbors[args.observer_agent : args.observer_agent + 1]
+                        obs_logits = shared_agent.predict_next_token_logits(
+                            obs_state, obs_neighbors, observer_id_t
+                        ).squeeze(0)
+
+                        ce = F.cross_entropy(obs_logits, tokens[:, t + 1], reduction="mean")
+                        total_ce += float(ce.item()) * args.batch_size
+                        pred_tokens = torch.argmax(obs_logits, dim=-1)
+                        total_correct += int((pred_tokens == tokens[:, t + 1]).sum().item())
+                        total_tokens += args.batch_size
+
+                        next_input = base_inputs.clone()
+                        next_input[args.observer_agent] = shared_agent.encode_tokens(pred_tokens)
+                        next_states = shared_agent.form_states(next_input, curr_neighbors, agent_ids_t)
+                        curr_states = next_states
+
+        shared_agent.train()
+        avg_ce = total_ce / max(1, total_tokens)
+        avg_acc = total_correct / max(1, total_tokens)
+        return avg_ce, avg_acc
 
     for ep in range(1, args.epochs + 1):
         total_metric = 0.0
@@ -522,10 +574,18 @@ def main() -> None:
             total_avg = total_metric / max(1, total_count)
             obs_avg = obs_ce / max(1, obs_count)
             mse_avg = neighbor_mse / max(1, neighbor_count)
-            print(
-                f"Ep {ep:4d} | CE observer: {obs_avg:.4f} | "
-                f"MSE neighbor-state (all agents): {mse_avg:.4f} | mixed total: {total_avg:.4f}"
-            )
+            if args.eval_batches > 0:
+                eval_ce, eval_acc = autoregressive_token_eval()
+                print(
+                    f"Ep {ep:4d} | CE observer: {obs_avg:.4f} | "
+                    f"MSE neighbor-state (all agents): {mse_avg:.4f} | mixed total: {total_avg:.4f} | "
+                    f"AR eval CE: {eval_ce:.4f} | AR eval acc: {eval_acc:.4f}"
+                )
+            else:
+                print(
+                    f"Ep {ep:4d} | CE observer: {obs_avg:.4f} | "
+                    f"MSE neighbor-state (all agents): {mse_avg:.4f} | mixed total: {total_avg:.4f}"
+                )
 
 
 if __name__ == "__main__":

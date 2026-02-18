@@ -113,6 +113,7 @@ Additional performance flags for the shared variant:
 ```bash
 --compile auto|on|off
 --amp auto|on|off
+--eval-batches 8
 ```
 
 Additional dataset options (requires torchtext for real datasets):
