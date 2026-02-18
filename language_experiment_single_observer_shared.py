@@ -410,8 +410,15 @@ def main() -> None:
 
     opt = torch.optim.Adam(shared_agent.parameters(), lr=args.lr)
 
-    total_params = sum(p.numel() for p in shared_agent.parameters())
-    trainable_params = sum(p.numel() for p in shared_agent.parameters() if p.requires_grad)
+    stats_model = shared_agent._orig_mod if hasattr(shared_agent, "_orig_mod") else shared_agent
+    total_params = sum(p.numel() for p in stats_model.parameters())
+    trainable_params = sum(p.numel() for p in stats_model.parameters() if p.requires_grad)
+    token_embedding_params = stats_model.embedding.weight.numel()
+    agent_embedding_params = stats_model.agent_embedding.weight.numel()
+    encoder_params = sum(p.numel() for p in stats_model.encoder.parameters())
+    state_updater_params = sum(p.numel() for p in stats_model.state_updater.parameters())
+    token_head_params = sum(p.numel() for p in stats_model.token_predictor.parameters())
+    state_head_params = sum(p.numel() for p in stats_model.state_predictor.parameters())
     print("Vocab size:", vocab_size)
     print("Agents:", args.agents)
     print("Observer agent:", args.observer_agent)
@@ -426,6 +433,13 @@ def main() -> None:
     print(f"  torch.compile active: {use_compile}")
     print(f"  AMP active: {use_amp}")
     print(f"  Trainable parameters: {trainable_params:,} / total: {total_params:,}")
+    print("  Parameter breakdown:")
+    print(f"    token embedding: {token_embedding_params:,}")
+    print(f"    agent identity embedding: {agent_embedding_params:,}")
+    print(f"    encoder: {encoder_params:,}")
+    print(f"    state updater: {state_updater_params:,}")
+    print(f"    token head: {token_head_params:,}")
+    print(f"    neighbor-state head: {state_head_params:,}")
 
     agent_ids_t = torch.arange(args.agents, device=device, dtype=torch.long)
     observer_id_t = torch.as_tensor([args.observer_agent], device=device, dtype=torch.long)
