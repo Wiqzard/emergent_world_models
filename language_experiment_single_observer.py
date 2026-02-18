@@ -320,6 +320,7 @@ def main() -> None:
             device = torch.device("cpu")
     else:
         device = torch.device(args.device)
+    print("Using device:", device)
 
     agents = nn.ModuleList(
         [
@@ -351,7 +352,6 @@ def main() -> None:
     if args.graph not in {"full", "ring", "line", "grid", "star"}:
         print("Neighbors per agent:", k_neighbors)
     print("Unroll steps:", args.unroll_steps)
-    print("Device:", device)
     print("Model overview:")
     print("  Single observer receives token; all agents receive previous-step neighbor states")
     print("  All agents -> neighbor-next-state MSE; observer additionally -> next-token CE")
