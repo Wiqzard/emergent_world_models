@@ -63,7 +63,7 @@ python experiment.py
 
 ## Language experiment
 
-A small language-modeling variant with a causal rollout over agent index. Within each sampled window of length `agents+1`, step `k` reveals tokens only to observer agents `<= k` (later observers still receive zero input). At step `k`, agent `k` predicts token `t_{k+1}`. Non-observers always receive zero input and are trained with neighbor-state prediction. Sentences must be long enough for the chosen number of agents (or use `--sequence-mode stream` to concatenate).
+A small language-modeling variant with a causal rollout over agent index. Within each sampled window of length `agents+1`, step `k` reveals tokens only to observer agents `<= k` (later observers still receive zero input). At each step, every agent forms its new latent state from its current input plus all neighbor latent states from the previous rollout step. Agent `k` then predicts token `t_{k+1}`. Non-observers are trained with neighbor-state prediction. Sentences must be long enough for the chosen number of agents (or use `--sequence-mode stream` to concatenate).
 
 ```bash
 python language_experiment.py

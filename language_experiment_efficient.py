@@ -52,7 +52,9 @@ class Agent(nn.Module):
         self.num_neighbors = num_neighbors
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.encoder = MLP(embed_dim, state_dim, hidden_dim, hidden_layers)
-        pred_in = state_dim * (1 + num_neighbors)
+        state_in = state_dim * (1 + num_neighbors)
+        self.state_updater = MLP(state_in, state_dim, hidden_dim, hidden_layers)
+        pred_in = state_in
         self.token_predictor = MLP(pred_in, vocab_size, hidden_dim, hidden_layers)
         self.state_predictor = MLP(pred_in, state_dim * num_neighbors, hidden_dim, hidden_layers)
 
@@ -60,18 +62,22 @@ class Agent(nn.Module):
         emb = self.embedding(token_ids)
         return self.encoder(emb)
 
-    def _predict_features(self, self_state: torch.Tensor, neighbor_states: torch.Tensor) -> torch.Tensor:
+    def _state_features(self, self_state: torch.Tensor, neighbor_states: torch.Tensor) -> torch.Tensor:
         # self_state: [B, state_dim], neighbor_states: [B, num_neighbors, state_dim]
         bsz = self_state.shape[0]
         flat_neighbors = neighbor_states.reshape(bsz, -1)
         return torch.cat([self_state, flat_neighbors], dim=-1)
 
+    def form_state(self, input_state: torch.Tensor, prev_neighbor_states: torch.Tensor) -> torch.Tensor:
+        x = self._state_features(input_state, prev_neighbor_states)
+        return self.state_updater(x)
+
     def predict_next_token(self, self_state: torch.Tensor, neighbor_states: torch.Tensor) -> torch.Tensor:
-        x = self._predict_features(self_state, neighbor_states)
+        x = self._state_features(self_state, neighbor_states)
         return self.token_predictor(x)  # [B, vocab]
 
     def predict_neighbor_states(self, self_state: torch.Tensor, neighbor_states: torch.Tensor) -> torch.Tensor:
-        x = self._predict_features(self_state, neighbor_states)
+        x = self._state_features(self_state, neighbor_states)
         pred = self.state_predictor(x)
         return pred.reshape(self_state.shape[0], self.num_neighbors, self.state_dim)
 
@@ -369,7 +375,8 @@ def main() -> None:
     print("Model overview:")
     print("  Heads: observers -> token CE, non-observers -> neighbor-state MSE")
     print("  Token prediction schedule: causal rollout over agent index (prefix reveal)")
-    print("  Implementation: precompute per-batch states, then apply rollout visibility masks")
+    print("  State update: each agent uses neighbor states from previous rollout step")
+    print("  Implementation: precompute per-batch input encodings, then recurrent state rollout")
     print(f"  Trainable parameters: {trainable_params:,} / total: {total_params:,}")
     print(f"  Parameters per agent (agent 0): {per_agent_params:,}")
     print(
@@ -393,33 +400,44 @@ def main() -> None:
             x_tp1_t = torch.as_tensor(x_tp1, dtype=torch.long, device=device)
 
             zero_embed = torch.zeros((args.batch_size, args.embed_dim), device=device)
-            zero_states = []
-            zero_next_states = []
-            observed_states = []
-            observed_next_states = []
+            zero_input_states = []
+            observed_input_states = []
+            observed_next_input_states = []
             for i in range(args.agents):
                 z_i = agents[i].encoder(zero_embed)
-                z_i_next = agents[i].encoder(zero_embed)
-                zero_states.append(z_i)
-                zero_next_states.append(z_i_next)
+                zero_input_states.append(z_i)
                 if is_observer[i]:
-                    observed_states.append(agents[i].encode(x_t_t[:, i]))
-                    observed_next_states.append(agents[i].encode(x_tp1_t[:, i]))
+                    observed_input_states.append(agents[i].encode(x_t_t[:, i]))
+                    observed_next_input_states.append(agents[i].encode(x_tp1_t[:, i]))
                 else:
-                    observed_states.append(z_i)
-                    observed_next_states.append(z_i_next)
-            zero_states_t = torch.stack(zero_states, dim=0)  # [A, B, state_dim]
-            zero_next_states_t = torch.stack(zero_next_states, dim=0)  # [A, B, state_dim]
-            observed_states_t = torch.stack(observed_states, dim=0)  # [A, B, state_dim]
-            observed_next_states_t = torch.stack(observed_next_states, dim=0)  # [A, B, state_dim]
+                    observed_input_states.append(z_i)
+                    observed_next_input_states.append(z_i)
+            zero_input_states_t = torch.stack(zero_input_states, dim=0)  # [A, B, state_dim]
+            observed_input_states_t = torch.stack(observed_input_states, dim=0)  # [A, B, state_dim]
+            observed_next_input_states_t = torch.stack(observed_next_input_states, dim=0)  # [A, B, state_dim]
+
+            prev_states = torch.zeros((args.agents, args.batch_size, args.state_dim), device=device)
+            prev_next_states = torch.zeros((args.agents, args.batch_size, args.state_dim), device=device)
 
             loss = torch.tensor(0.0, device=device)
             step_metric = []
-            # Causal rollout: states are selected from precomputed tensors via prefix visibility mask.
+            # Causal rollout: visible observers receive tokens; state uses previous-step neighbor states.
             for k in range(args.agents):
                 visible_mask = rollout_visible[k]  # [A, 1, 1]
-                states = torch.where(visible_mask, observed_states_t, zero_states_t)
-                next_states = torch.where(visible_mask, observed_next_states_t, zero_next_states_t)
+                input_states = torch.where(visible_mask, observed_input_states_t, zero_input_states_t)
+                next_input_states = torch.where(visible_mask, observed_next_input_states_t, zero_input_states_t)
+                states = []
+                next_states = []
+                for i in range(args.agents):
+                    neigh_idx = neighbor_index_tensors[i]
+                    prev_neigh_states = torch.index_select(prev_states, 0, neigh_idx).permute(1, 0, 2)
+                    prev_next_neigh_states = torch.index_select(prev_next_states, 0, neigh_idx).permute(1, 0, 2)
+                    s_i = agents[i].form_state(input_states[i], prev_neigh_states)
+                    s_i_next = agents[i].form_state(next_input_states[i], prev_next_neigh_states)
+                    states.append(s_i)
+                    next_states.append(s_i_next)
+                states = torch.stack(states, dim=0)  # [A, B, state_dim]
+                next_states = torch.stack(next_states, dim=0)  # [A, B, state_dim]
 
                 if is_observer[k]:
                     neigh_k_idx = neighbor_index_tensors[k]
@@ -437,6 +455,9 @@ def main() -> None:
                     mse = F.mse_loss(pred_neighbor_states, target_neighbor_states, reduction="mean")
                     loss = loss + mse
                     step_metric.append((False, mse.item()))
+
+                prev_states = states
+                prev_next_states = next_states
 
             opt.zero_grad()
             loss.backward()
