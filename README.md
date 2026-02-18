@@ -63,7 +63,7 @@ conda run -n emergent-multiagent python "/Users/sebastianstapf/Documents/emergen
 
 ## Language experiment
 
-A small language-modeling variant where observer agents see the current token and predict the next token with cross-entropy.
+A small language-modeling variant with an RNN-style alignment: agent i sees token t_i and predicts token t_{i+1} within a sampled window of length agents+1. Observer agents receive their token; non-observers get zero input but still predict for evaluation. Sentences must be long enough for the chosen number of agents.
 
 ```bash
 conda run -n emergent-multiagent python "/Users/sebastianstapf/Documents/emergent_world_models/language_experiment.py"

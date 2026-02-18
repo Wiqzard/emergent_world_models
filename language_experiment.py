@@ -177,15 +177,19 @@ def encode_sentences(sentences: List[str], stoi: dict) -> List[List[int]]:
 
 
 
-def sample_batch(seqs: List[List[int]], batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
-    x_t = np.zeros((batch_size,), dtype=np.int64)
-    x_tp1 = np.zeros((batch_size,), dtype=np.int64)
+def sample_windows(seqs: List[List[int]], batch_size: int, window_len: int) -> np.ndarray:
+    if not seqs:
+        raise ValueError("No sequences available for sampling")
+    windows = np.zeros((batch_size, window_len), dtype=np.int64)
     for i in range(batch_size):
         seq = random.choice(seqs)
-        t = random.randrange(0, len(seq) - 1)
-        x_t[i] = seq[t]
-        x_tp1[i] = seq[t + 1]
-    return x_t, x_tp1
+        if len(seq) < window_len:
+            raise ValueError("Sequence too short for requested window length")
+        max_start = len(seq) - window_len
+        start = random.randrange(0, max_start + 1) if max_start > 0 else 0
+        window = seq[start : start + window_len]
+        windows[i] = np.asarray(window, dtype=np.int64)
+    return windows
 
 
 
@@ -232,6 +236,11 @@ def main() -> None:
     stoi, vocab = build_vocab(sentences)
     seqs = encode_sentences(sentences, stoi)
     vocab_size = len(vocab)
+
+    window_len = args.agents + 1
+    valid_seqs = [s for s in seqs if len(s) >= window_len]
+    if not valid_seqs:
+        raise ValueError("No sequences long enough for the number of agents. Provide longer sentences or reduce --agents.")
 
     k_neighbors = args.neighbors if args.neighbors is not None else args.degree
     graph = build_graph(args.agents, args.graph, k_neighbors)
@@ -286,14 +295,16 @@ def main() -> None:
         nonobs_count = 0
 
         for _ in range(args.steps_per_epoch):
-            x_t, x_tp1 = sample_batch(seqs, args.batch_size)
+            windows = sample_windows(valid_seqs, args.batch_size, window_len)
+            x_t = windows[:, :-1]
+            x_tp1 = windows[:, 1:]
             x_t_t = torch.as_tensor(x_t, dtype=torch.long, device=device)
             x_tp1_t = torch.as_tensor(x_tp1, dtype=torch.long, device=device)
 
             states = []
             for i in range(args.agents):
                 if is_observer[i]:
-                    s_i = agents[i].encode(x_t_t)
+                    s_i = agents[i].encode(x_t_t[:, i])
                 else:
                     s_i = agents[i].encoder(torch.zeros((args.batch_size, args.embed_dim), device=device))
                 states.append(s_i)
@@ -305,7 +316,7 @@ def main() -> None:
                 neigh = graph.neighbors[i]
                 neigh_states = states[neigh].permute(1, 0, 2)  # [B, N, state_dim]
                 logits = agents[i].predict_next(states[i], neigh_states)
-                ce = F.cross_entropy(logits, x_tp1_t, reduction="mean")
+                ce = F.cross_entropy(logits, x_tp1_t[:, i], reduction="mean")
                 loss = loss + ce
                 step_ce.append(ce.item())
 
