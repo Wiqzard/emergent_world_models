@@ -81,6 +81,12 @@ Single-observer recurrent variant (observer gets token; all agents predict neigh
 python language_experiment_single_observer.py
 ```
 
+Shared-weights efficient single-observer variant (one shared agent over flattened agent batch, with per-agent identity embeddings):
+
+```bash
+python language_experiment_single_observer_shared.py
+```
+
 Useful flags:
 
 ```bash
@@ -100,6 +106,13 @@ Additional flags for the single-observer variant:
 ```bash
 --observer-agent 0
 --unroll-steps 16
+```
+
+Additional performance flags for the shared variant:
+
+```bash
+--compile auto|on|off
+--amp auto|on|off
 ```
 
 Additional dataset options (requires torchtext for real datasets):
