@@ -193,6 +193,43 @@ def sample_windows(seqs: List[List[int]], batch_size: int, window_len: int) -> n
 
 
 
+def load_torchtext_sentences(dataset: str, root: str | None, split: str) -> List[str]:
+    try:
+        from torchtext.datasets import WikiText2, PennTreebank
+    except Exception as exc:
+        raise RuntimeError(
+            "torchtext is required for real datasets. Install with: conda install -c conda-forge torchtext"
+        ) from exc
+
+    if dataset == "wikitext2":
+        dataset_cls = WikiText2
+    elif dataset == "ptb":
+        dataset_cls = PennTreebank
+    else:
+        raise ValueError(f"Unknown dataset: {dataset}")
+
+    try:
+        ds = dataset_cls(root=root, split=split)
+    except TypeError:
+        ds = dataset_cls(root=root)
+        if isinstance(ds, (tuple, list)):
+            split_map = {"train": 0, "valid": 1, "test": 2}
+            ds = ds[split_map.get(split, 0)]
+
+    lines: List[str] = []
+    for item in ds:
+        line = item[0] if isinstance(item, (tuple, list)) else item
+        if not isinstance(line, str):
+            line = str(line)
+        line = line.strip()
+        if line:
+            lines.append(line)
+    return lines
+
+
+
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--agents", type=int, default=16)
@@ -212,6 +249,9 @@ def main() -> None:
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--corpus-file", type=str, default=None)
+    parser.add_argument("--dataset", type=str, default="toy", choices=["toy", "wikitext2", "ptb"])
+    parser.add_argument("--dataset-root", type=str, default=None)
+    parser.add_argument("--dataset-split", type=str, default="train")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -219,6 +259,8 @@ def main() -> None:
     if args.corpus_file:
         with open(args.corpus_file, "r", encoding="utf-8") as f:
             sentences = [line.strip() for line in f if line.strip()]
+    elif args.dataset != "toy":
+        sentences = load_torchtext_sentences(args.dataset, args.dataset_root, args.dataset_split)
     else:
         sentences = [
             "the cat sat on the mat",

@@ -81,3 +81,17 @@ Useful flags:
 --epochs 100
 --steps-per-epoch 200
 ```
+
+Additional dataset options (requires torchtext for real datasets):
+
+```bash
+--dataset toy|wikitext2|ptb
+--dataset-root /path/to/cache
+--dataset-split train|valid|test
+```
+
+Torchtext install:
+
+```bash
+conda install -c conda-forge torchtext
+```
