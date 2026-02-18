@@ -7,19 +7,19 @@ This repo contains a simple multi-agent experiment where agents receive partial 
 Create the conda environment:
 
 ```bash
-conda env create -f "/Users/sebastianstapf/Documents/emergent_world_models/environment.yml"
+conda env create -f environment.yml
 ```
 
 Activate it (if your conda registry isn't writable, activate by path):
 
 ```bash
-conda activate /opt/homebrew/anaconda3/envs/emergent-multiagent
+conda activate emergent-multiagent
 ```
 
 ## Run
 
 ```bash
-conda run -n emergent-multiagent python "/Users/sebastianstapf/Documents/emergent_world_models/experiment.py"
+conda run -n emergent-multiagent python experiment.py
 ```
 
 ## Notes
@@ -66,7 +66,7 @@ conda run -n emergent-multiagent python "/Users/sebastianstapf/Documents/emergen
 A small language-modeling variant with an RNN-style alignment: agent i sees token t_i and predicts token t_{i+1} within a sampled window of length agents+1. Observer agents receive their token; non-observers get zero input but still predict for evaluation. Sentences must be long enough for the chosen number of agents.
 
 ```bash
-conda run -n emergent-multiagent python "/Users/sebastianstapf/Documents/emergent_world_models/language_experiment.py"
+conda run -n emergent-multiagent python language_experiment.py
 ```
 
 Useful flags:
