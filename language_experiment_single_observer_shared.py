@@ -293,7 +293,6 @@ def main() -> None:
     parser.add_argument("--neighbors", type=int, default=None)
     parser.add_argument("--degree", type=int, default=4)  # deprecated alias for neighbors
     parser.add_argument("--observer-agent", type=int, default=0)
-    parser.add_argument("--predictor-agent", type=int, default=1)
     parser.add_argument("--embed-dim", type=int, default=32)
     parser.add_argument("--state-dim", type=int, default=32)
     parser.add_argument("--hidden-dim", type=int, default=64)
@@ -324,10 +323,6 @@ def main() -> None:
         raise ValueError("--eval-batches must be >= 0")
     if args.observer_agent < 0 or args.observer_agent >= args.agents:
         raise ValueError("--observer-agent must be in [0, agents-1]")
-    if args.predictor_agent < 0 or args.predictor_agent >= args.agents:
-        raise ValueError("--predictor-agent must be in [0, agents-1]")
-    if args.predictor_agent == args.observer_agent:
-        raise ValueError("--predictor-agent must be different from --observer-agent")
 
     set_seed(args.seed)
 
@@ -430,7 +425,6 @@ def main() -> None:
     print("Vocab size:", vocab_size)
     print("Agents:", args.agents)
     print("Observer agent:", args.observer_agent)
-    print("Predictor agent:", args.predictor_agent)
     print("Graph:", args.graph)
     if args.graph not in {"full", "ring", "line", "grid", "star"}:
         print("Neighbors per agent:", k_neighbors)
@@ -439,7 +433,7 @@ def main() -> None:
     print("Model overview:")
     print("  Shared agent weights across all positions")
     print("  Per-agent learned identity embedding added to state features")
-    print("  Observer predicts next token; predictor predicts neighbor next states")
+    print("  All agents predict neighbor next states; observer additionally predicts next token")
     print(f"  torch.compile active: {use_compile}")
     print(f"  AMP active: {use_amp}")
     print(f"  Trainable parameters: {trainable_params:,} / total: {total_params:,}")
@@ -453,7 +447,6 @@ def main() -> None:
 
     agent_ids_t = torch.arange(args.agents, device=device, dtype=torch.long)
     observer_id_t = torch.as_tensor([args.observer_agent], device=device, dtype=torch.long)
-    predictor_id_t = torch.as_tensor([args.predictor_agent], device=device, dtype=torch.long)
 
     def autoregressive_token_eval() -> Tuple[float, float]:
         if args.eval_batches == 0:
@@ -508,8 +501,8 @@ def main() -> None:
         total_count = 0
         obs_ce = 0.0
         obs_count = 0
-        pred_mse = 0.0
-        pred_count = 0
+        neighbor_mse = 0.0
+        neighbor_count = 0
 
         for _ in range(args.steps_per_epoch):
             windows = sample_windows(valid_seqs, args.batch_size, window_len)
@@ -545,16 +538,12 @@ def main() -> None:
                     loss = loss + ce
                     step_metrics.append((True, float(ce.detach().item())))
 
-                    pred_state = curr_states[args.predictor_agent : args.predictor_agent + 1]
-                    pred_neighbors_in = curr_neighbors[args.predictor_agent : args.predictor_agent + 1]
-                    pred_neighbors = shared_agent.predict_neighbor_states(pred_state, pred_neighbors_in, predictor_id_t)
-                    target_neighbors = gather_neighbor_states(next_states, neighbor_idx_t, neighbor_mask_t)[
-                        args.predictor_agent : args.predictor_agent + 1
-                    ]
+                    pred_neighbors = shared_agent.predict_neighbor_states(curr_states, curr_neighbors, agent_ids_t)
+                    target_neighbors = gather_neighbor_states(next_states, neighbor_idx_t, neighbor_mask_t)
                     mse = masked_neighbor_mse(
                         pred_neighbors,
                         target_neighbors,
-                        neighbor_mask_t[args.predictor_agent : args.predictor_agent + 1],
+                        neighbor_mask_t,
                         batch_size=args.batch_size,
                         state_dim=args.state_dim,
                     )
@@ -578,24 +567,24 @@ def main() -> None:
                     obs_ce += metric_val
                     obs_count += 1
                 else:
-                    pred_mse += metric_val
-                    pred_count += 1
+                    neighbor_mse += metric_val
+                    neighbor_count += 1
 
         if ep % args.log_interval == 0:
             total_avg = total_metric / max(1, total_count)
             obs_avg = obs_ce / max(1, obs_count)
-            mse_avg = pred_mse / max(1, pred_count)
+            mse_avg = neighbor_mse / max(1, neighbor_count)
             if args.eval_batches > 0:
                 eval_ce, eval_acc = autoregressive_token_eval()
                 print(
                     f"Ep {ep:4d} | CE observer: {obs_avg:.4f} | "
-                    f"MSE predictor neighbor-state: {mse_avg:.4f} | mixed total: {total_avg:.4f} | "
+                    f"MSE neighbor-state (all agents): {mse_avg:.4f} | mixed total: {total_avg:.4f} | "
                     f"AR eval CE: {eval_ce:.4f} | AR eval acc: {eval_acc:.4f}"
                 )
             else:
                 print(
                     f"Ep {ep:4d} | CE observer: {obs_avg:.4f} | "
-                    f"MSE predictor neighbor-state: {mse_avg:.4f} | mixed total: {total_avg:.4f}"
+                    f"MSE neighbor-state (all agents): {mse_avg:.4f} | mixed total: {total_avg:.4f}"
                 )
 
 
