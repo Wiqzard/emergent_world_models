@@ -48,21 +48,32 @@ class Agent(nn.Module):
         hidden_layers: int = 2,
     ):
         super().__init__()
+        self.state_dim = state_dim
+        self.num_neighbors = num_neighbors
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.encoder = MLP(embed_dim, state_dim, hidden_dim, hidden_layers)
         pred_in = state_dim * (1 + num_neighbors)
-        self.predictor = MLP(pred_in, vocab_size, hidden_dim, hidden_layers)
+        self.token_predictor = MLP(pred_in, vocab_size, hidden_dim, hidden_layers)
+        self.state_predictor = MLP(pred_in, state_dim * num_neighbors, hidden_dim, hidden_layers)
 
     def encode(self, token_ids: torch.Tensor) -> torch.Tensor:
         emb = self.embedding(token_ids)
         return self.encoder(emb)
 
-    def predict_next(self, self_state: torch.Tensor, neighbor_states: torch.Tensor) -> torch.Tensor:
+    def _predict_features(self, self_state: torch.Tensor, neighbor_states: torch.Tensor) -> torch.Tensor:
         # self_state: [B, state_dim], neighbor_states: [B, num_neighbors, state_dim]
         bsz = self_state.shape[0]
         flat_neighbors = neighbor_states.reshape(bsz, -1)
-        x = torch.cat([self_state, flat_neighbors], dim=-1)
-        return self.predictor(x)  # [B, vocab]
+        return torch.cat([self_state, flat_neighbors], dim=-1)
+
+    def predict_next_token(self, self_state: torch.Tensor, neighbor_states: torch.Tensor) -> torch.Tensor:
+        x = self._predict_features(self_state, neighbor_states)
+        return self.token_predictor(x)  # [B, vocab]
+
+    def predict_neighbor_states(self, self_state: torch.Tensor, neighbor_states: torch.Tensor) -> torch.Tensor:
+        x = self._predict_features(self_state, neighbor_states)
+        pred = self.state_predictor(x)
+        return pred.reshape(self_state.shape[0], self.num_neighbors, self.state_dim)
 
 
 
@@ -228,12 +239,15 @@ def load_torchtext_sentences(dataset: str, root: str | None, split: str) -> List
 
 
 
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--agents", type=int, default=16)
-    parser.add_argument("--graph", type=str, default="ring", choices=["ring", "ring-k", "line", "full", "random", "dense", "grid", "star"])
+    parser.add_argument(
+        "--graph",
+        type=str,
+        default="ring",
+        choices=["ring", "ring-k", "line", "full", "random", "dense", "grid", "star"],
+    )
     parser.add_argument("--neighbors", type=int, default=None)
     parser.add_argument("--degree", type=int, default=4)  # deprecated alias for neighbors
     parser.add_argument("--observer-frac", type=float, default=0.5)
@@ -291,7 +305,9 @@ def main() -> None:
     window_len = args.agents + 1
     valid_seqs = [s for s in seqs_for_sampling if len(s) >= window_len]
     if not valid_seqs:
-        raise ValueError("No sequences long enough for the number of agents. Provide longer sentences, use --sequence-mode stream, or reduce --agents.")
+        raise ValueError(
+            "No sequences long enough for the number of agents. Provide longer sentences, use --sequence-mode stream, or reduce --agents."
+        )
 
     k_neighbors = args.neighbors if args.neighbors is not None else args.degree
     graph = build_graph(args.agents, args.graph, k_neighbors)
@@ -327,6 +343,10 @@ def main() -> None:
     ).to(device)
 
     opt = torch.optim.Adam(agents.parameters(), lr=args.lr)
+    total_params = sum(p.numel() for p in agents.parameters())
+    trainable_params = sum(p.numel() for p in agents.parameters() if p.requires_grad)
+    per_agent_params = sum(p.numel() for p in agents[0].parameters()) if args.agents > 0 else 0
+    neighbor_counts = [len(graph.neighbors[i]) for i in range(args.agents)]
 
     print("Vocab size:", vocab_size)
     print("Agents:", args.agents)
@@ -336,13 +356,22 @@ def main() -> None:
     print("Observer agents:", int(is_observer.sum()))
     print("Non-observer agents:", int((~is_observer).sum()))
     print("Device:", device)
+    print("Model overview:")
+    print("  Heads: observers -> token CE, non-observers -> neighbor-state MSE")
+    print("  Token prediction schedule: causal rollout over agent index (prefix reveal)")
+    print(f"  Trainable parameters: {trainable_params:,} / total: {total_params:,}")
+    print(f"  Parameters per agent (agent 0): {per_agent_params:,}")
+    print(
+        "  Neighbor count stats (min/avg/max): "
+        f"{min(neighbor_counts)}/{(sum(neighbor_counts) / len(neighbor_counts)):.2f}/{max(neighbor_counts)}"
+    )
 
     for ep in range(1, args.epochs + 1):
-        total_ce = 0.0
+        total_metric = 0.0
         total_count = 0
         obs_ce = 0.0
         obs_count = 0
-        nonobs_ce = 0.0
+        nonobs_mse = 0.0
         nonobs_count = 0
 
         for _ in range(args.steps_per_epoch):
@@ -352,46 +381,66 @@ def main() -> None:
             x_t_t = torch.as_tensor(x_t, dtype=torch.long, device=device)
             x_tp1_t = torch.as_tensor(x_tp1, dtype=torch.long, device=device)
 
-            states = []
-            for i in range(args.agents):
-                if is_observer[i]:
-                    s_i = agents[i].encode(x_t_t[:, i])
-                else:
-                    s_i = agents[i].encoder(torch.zeros((args.batch_size, args.embed_dim), device=device))
-                states.append(s_i)
-            states = torch.stack(states, dim=0)  # [A, B, state_dim]
+            zero_embed = torch.zeros((args.batch_size, args.embed_dim), device=device)
+            loss = torch.tensor(0.0, device=device)
+            step_metric = []
+            # Causal rollout: at step k, only observer agents up to index k can see tokens.
+            for k in range(args.agents):
+                states = []
+                next_states = []
+                for i in range(args.agents):
+                    is_visible_observer = bool(is_observer[i]) and (i <= k)
+                    if is_visible_observer:
+                        s_i = agents[i].encode(x_t_t[:, i])
+                        s_i_next = agents[i].encode(x_tp1_t[:, i])
+                    else:
+                        s_i = agents[i].encoder(zero_embed)
+                        s_i_next = agents[i].encoder(zero_embed)
+                    states.append(s_i)
+                    next_states.append(s_i_next)
+                states = torch.stack(states, dim=0)  # [A, B, state_dim]
+                next_states = torch.stack(next_states, dim=0)  # [A, B, state_dim]
 
-            loss = 0.0
-            step_ce = []
-            for i in range(args.agents):
-                neigh = graph.neighbors[i]
-                neigh_states = states[neigh].permute(1, 0, 2)  # [B, N, state_dim]
-                logits = agents[i].predict_next(states[i], neigh_states)
-                ce = F.cross_entropy(logits, x_tp1_t[:, i], reduction="mean")
-                loss = loss + ce
-                step_ce.append(ce.item())
+                if is_observer[k]:
+                    neigh_k = graph.neighbors[k]
+                    neigh_states_k = states[neigh_k].permute(1, 0, 2)  # [B, N, state_dim]
+                    logits = agents[k].predict_next_token(states[k], neigh_states_k)
+                    ce = F.cross_entropy(logits, x_tp1_t[:, k], reduction="mean")
+                    loss = loss + ce
+                    step_metric.append((True, ce.item()))
+
+                for i in range(args.agents):
+                    if is_observer[i]:
+                        continue
+                    neigh = graph.neighbors[i]
+                    neigh_states = states[neigh].permute(1, 0, 2)  # [B, N, state_dim]
+                    pred_neighbor_states = agents[i].predict_neighbor_states(states[i], neigh_states)
+                    target_neighbor_states = next_states[neigh].permute(1, 0, 2)
+                    mse = F.mse_loss(pred_neighbor_states, target_neighbor_states, reduction="mean")
+                    loss = loss + mse
+                    step_metric.append((False, mse.item()))
 
             opt.zero_grad()
             loss.backward()
             opt.step()
 
-            for i, ce_val in enumerate(step_ce):
-                total_ce += ce_val
+            for is_obs_metric, metric_val in step_metric:
+                total_metric += metric_val
                 total_count += 1
-                if is_observer[i]:
-                    obs_ce += ce_val
+                if is_obs_metric:
+                    obs_ce += metric_val
                     obs_count += 1
                 else:
-                    nonobs_ce += ce_val
+                    nonobs_mse += metric_val
                     nonobs_count += 1
 
         if ep % args.log_interval == 0:
-            total_avg = total_ce / max(1, total_count)
+            total_avg = total_metric / max(1, total_count)
             obs_avg = obs_ce / max(1, obs_count)
-            nonobs_avg = nonobs_ce / max(1, nonobs_count)
+            nonobs_avg = nonobs_mse / max(1, nonobs_count)
             print(
                 f"Ep {ep:4d} | CE observers: {obs_avg:.4f} | "
-                f"CE non-observers: {nonobs_avg:.4f} | CE total: {total_avg:.4f}"
+                f"MSE non-observers: {nonobs_avg:.4f} | mixed total: {total_avg:.4f}"
             )
 
 

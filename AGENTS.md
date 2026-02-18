@@ -20,3 +20,4 @@ This repo contains lightweight, reproducible experiments for emergent world mode
 ## When editing
 - Preserve existing CLI flags unless a change is explicitly requested.
 - Document new flags in `README.md`.
+- After completing requested code/doc changes, commit and push to GitHub automatically unless explicitly told not to.

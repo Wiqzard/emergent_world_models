@@ -63,7 +63,7 @@ python experiment.py
 
 ## Language experiment
 
-A small language-modeling variant with an RNN-style alignment: agent i sees token t_i and predicts token t_{i+1} within a sampled window of length agents+1. Observer agents receive their token; non-observers get zero input but still predict for evaluation. Sentences must be long enough for the chosen number of agents (or use --sequence-mode stream to concatenate).
+A small language-modeling variant with a causal rollout over agent index. Within each sampled window of length `agents+1`, step `k` reveals tokens only to observer agents `<= k` (later observers still receive zero input). At step `k`, agent `k` predicts token `t_{k+1}`. Non-observers always receive zero input and are trained with neighbor-state prediction. Sentences must be long enough for the chosen number of agents (or use `--sequence-mode stream` to concatenate).
 
 ```bash
 python language_experiment.py
