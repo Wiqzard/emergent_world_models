@@ -75,6 +75,12 @@ Efficient causal implementation (same objective, less repeated encoding work per
 python language_experiment_efficient.py
 ```
 
+Single-observer recurrent variant (observer gets token; all agents predict neighbor next states; observer also predicts next token):
+
+```bash
+python language_experiment_single_observer.py
+```
+
 Useful flags:
 
 ```bash
@@ -87,6 +93,13 @@ Useful flags:
 --epochs 100
 --steps-per-epoch 200
 --sequence-mode stream|sentence
+```
+
+Additional flags for the single-observer variant:
+
+```bash
+--observer-agent 0
+--unroll-steps 16
 ```
 
 Additional dataset options (requires torchtext for real datasets):
