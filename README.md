@@ -81,7 +81,7 @@ Single-observer recurrent variant (observer gets token; all agents predict neigh
 python language_experiment_single_observer.py
 ```
 
-Shared-weights efficient single-observer variant (one shared agent over flattened agent batch, with per-agent identity embeddings):
+Shared-weights efficient single-observer variant (one shared agent over flattened agent batch, with per-agent identity embeddings; observer predicts token, separate predictor agent predicts neighbor next states):
 
 ```bash
 python language_experiment_single_observer_shared.py
@@ -105,6 +105,7 @@ Additional flags for the single-observer variant:
 
 ```bash
 --observer-agent 0
+--predictor-agent 1
 --unroll-steps 16
 ```
 
