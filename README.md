@@ -60,3 +60,24 @@ conda run -n emergent-multiagent python "/Users/sebastianstapf/Documents/emergen
 - `dense`: each agent connects to the next `--neighbors` agents in cyclic order.
 - `grid`: 2D grid with 4-neighborhood (requires perfect square number of agents).
 - `star`: agent 0 is hub; all others connect to it.
+
+## Language experiment
+
+A small language-modeling variant where observer agents see the current token and predict the next token with cross-entropy.
+
+```bash
+conda run -n emergent-multiagent python "/Users/sebastianstapf/Documents/emergent_world_models/language_experiment.py"
+```
+
+Useful flags:
+
+```bash
+--corpus-file /path/to/text.txt
+--embed-dim 32
+--state-dim 32
+--hidden-dim 64
+--hidden-layers 2
+--batch-size 32
+--epochs 100
+--steps-per-epoch 200
+```

@@ -1,0 +1,337 @@
+import argparse
+import random
+from dataclasses import dataclass
+from typing import List, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+@dataclass
+class Graph:
+    neighbors: List[List[int]]
+
+
+class MLP(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int = 64, hidden_layers: int = 2):
+        super().__init__()
+        layers: List[nn.Module] = []
+        last_dim = in_dim
+        for _ in range(hidden_layers):
+            layers.append(nn.Linear(last_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            last_dim = hidden_dim
+        layers.append(nn.Linear(last_dim, out_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class Agent(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        embed_dim: int,
+        state_dim: int,
+        num_neighbors: int,
+        hidden_dim: int = 64,
+        hidden_layers: int = 2,
+    ):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.encoder = MLP(embed_dim, state_dim, hidden_dim, hidden_layers)
+        pred_in = state_dim * (1 + num_neighbors)
+        self.predictor = MLP(pred_in, vocab_size, hidden_dim, hidden_layers)
+
+    def encode(self, token_ids: torch.Tensor) -> torch.Tensor:
+        emb = self.embedding(token_ids)
+        return self.encoder(emb)
+
+    def predict_next(self, self_state: torch.Tensor, neighbor_states: torch.Tensor) -> torch.Tensor:
+        # self_state: [B, state_dim], neighbor_states: [B, num_neighbors, state_dim]
+        bsz = self_state.shape[0]
+        flat_neighbors = neighbor_states.reshape(bsz, -1)
+        x = torch.cat([self_state, flat_neighbors], dim=-1)
+        return self.predictor(x)  # [B, vocab]
+
+
+
+def build_graph(num_agents: int, graph_type: str, neighbors: int) -> Graph:
+    if neighbors < 1 and graph_type not in {"full"}:
+        raise ValueError("neighbors must be >= 1 for non-full graphs")
+    if neighbors > num_agents - 1 and graph_type not in {"full"}:
+        raise ValueError("neighbors must be <= num_agents - 1")
+
+    if graph_type == "ring":
+        out = []
+        for i in range(num_agents):
+            out.append([(i - 1) % num_agents, (i + 1) % num_agents])
+        return Graph(out)
+    if graph_type == "ring-k":
+        if neighbors % 2 != 0:
+            raise ValueError("ring-k requires an even --neighbors value")
+        half = neighbors // 2
+        out = []
+        for i in range(num_agents):
+            neigh = []
+            for d in range(1, half + 1):
+                neigh.append((i - d) % num_agents)
+                neigh.append((i + d) % num_agents)
+            out.append(neigh)
+        return Graph(out)
+    if graph_type == "line":
+        out = []
+        for i in range(num_agents):
+            neigh = []
+            if i - 1 >= 0:
+                neigh.append(i - 1)
+            if i + 1 < num_agents:
+                neigh.append(i + 1)
+            out.append(neigh)
+        return Graph(out)
+    if graph_type == "full":
+        out = []
+        for i in range(num_agents):
+            out.append([j for j in range(num_agents) if j != i])
+        return Graph(out)
+    if graph_type == "random":
+        out = []
+        for i in range(num_agents):
+            choices = [j for j in range(num_agents) if j != i]
+            out.append(random.sample(choices, k=min(neighbors, len(choices))))
+        return Graph(out)
+    if graph_type == "dense":
+        out = []
+        for i in range(num_agents):
+            out.append([((i + d) % num_agents) for d in range(1, neighbors + 1)])
+        return Graph(out)
+    if graph_type == "grid":
+        side = int(round(num_agents ** 0.5))
+        if side * side != num_agents:
+            raise ValueError("grid graph requires num_agents to be a perfect square")
+        out = []
+        for idx in range(num_agents):
+            r, c = divmod(idx, side)
+            neigh = []
+            if r > 0:
+                neigh.append((r - 1) * side + c)
+            if r < side - 1:
+                neigh.append((r + 1) * side + c)
+            if c > 0:
+                neigh.append(r * side + (c - 1))
+            if c < side - 1:
+                neigh.append(r * side + (c + 1))
+            out.append(neigh)
+        return Graph(out)
+    if graph_type == "star":
+        out = []
+        for i in range(num_agents):
+            if i == 0:
+                out.append([j for j in range(1, num_agents)])
+            else:
+                out.append([0])
+        return Graph(out)
+    raise ValueError(f"Unknown graph_type: {graph_type}")
+
+
+
+def sample_observer_mask(num_agents: int, observer_frac: float) -> np.ndarray:
+    num_observers = max(1, int(round(num_agents * observer_frac)))
+    observer_idx = set(random.sample(range(num_agents), k=num_observers))
+    mask = np.zeros((num_agents,), dtype=bool)
+    for i in range(num_agents):
+        mask[i] = i in observer_idx
+    if mask.all():
+        mask[random.randrange(num_agents)] = False
+    return mask
+
+
+
+def build_vocab(sentences: List[str]) -> Tuple[dict, list]:
+    tokens = []
+    for s in sentences:
+        tokens.extend(s.strip().lower().split())
+    vocab = ["<pad>", "<unk>", "<bos>", "<eos>"] + sorted(set(tokens))
+    stoi = {tok: i for i, tok in enumerate(vocab)}
+    return stoi, vocab
+
+
+
+def encode_sentences(sentences: List[str], stoi: dict) -> List[List[int]]:
+    out = []
+    for s in sentences:
+        words = s.strip().lower().split()
+        ids = [stoi["<bos>"]] + [stoi.get(w, stoi["<unk>"]) for w in words] + [stoi["<eos>"]]
+        out.append(ids)
+    return out
+
+
+
+def sample_batch(seqs: List[List[int]], batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
+    x_t = np.zeros((batch_size,), dtype=np.int64)
+    x_tp1 = np.zeros((batch_size,), dtype=np.int64)
+    for i in range(batch_size):
+        seq = random.choice(seqs)
+        t = random.randrange(0, len(seq) - 1)
+        x_t[i] = seq[t]
+        x_tp1[i] = seq[t + 1]
+    return x_t, x_tp1
+
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--agents", type=int, default=16)
+    parser.add_argument("--graph", type=str, default="ring", choices=["ring", "ring-k", "line", "full", "random", "dense", "grid", "star"])
+    parser.add_argument("--neighbors", type=int, default=None)
+    parser.add_argument("--degree", type=int, default=4)  # deprecated alias for neighbors
+    parser.add_argument("--observer-frac", type=float, default=0.5)
+    parser.add_argument("--embed-dim", type=int, default=32)
+    parser.add_argument("--state-dim", type=int, default=32)
+    parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--hidden-layers", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--steps-per-epoch", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    parser.add_argument("--corpus-file", type=str, default=None)
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+
+    if args.corpus_file:
+        with open(args.corpus_file, "r", encoding="utf-8") as f:
+            sentences = [line.strip() for line in f if line.strip()]
+    else:
+        sentences = [
+            "the cat sat on the mat",
+            "the quick brown fox jumps over the lazy dog",
+            "language models learn to predict the next token",
+            "emergent behavior can arise from simple local rules",
+            "multi agent systems share information through a graph",
+            "we test observers and non observers on prediction",
+            "the world model summarizes past observations",
+            "neural networks can approximate complex dynamics",
+            "this is a small synthetic corpus for experiments",
+            "each agent sees only part of the state",
+        ]
+
+    stoi, vocab = build_vocab(sentences)
+    seqs = encode_sentences(sentences, stoi)
+    vocab_size = len(vocab)
+
+    k_neighbors = args.neighbors if args.neighbors is not None else args.degree
+    graph = build_graph(args.agents, args.graph, k_neighbors)
+    is_observer = sample_observer_mask(args.agents, args.observer_frac)
+
+    mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available. Use --device cpu, --device mps, or --device auto.")
+    if args.device == "mps" and not mps_available:
+        raise RuntimeError("MPS requested but not available. Use --device cpu, --device cuda, or --device auto.")
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif mps_available:
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
+
+    agents = nn.ModuleList(
+        [
+            Agent(
+                vocab_size=vocab_size,
+                embed_dim=args.embed_dim,
+                state_dim=args.state_dim,
+                num_neighbors=len(graph.neighbors[i]),
+                hidden_dim=args.hidden_dim,
+                hidden_layers=args.hidden_layers,
+            )
+            for i in range(args.agents)
+        ]
+    ).to(device)
+
+    opt = torch.optim.Adam(agents.parameters(), lr=args.lr)
+
+    print("Vocab size:", vocab_size)
+    print("Agents:", args.agents)
+    print("Graph:", args.graph)
+    if args.graph not in {"full", "ring", "line", "grid", "star"}:
+        print("Neighbors per agent:", k_neighbors)
+    print("Observer agents:", int(is_observer.sum()))
+    print("Non-observer agents:", int((~is_observer).sum()))
+    print("Device:", device)
+
+    for ep in range(1, args.epochs + 1):
+        total_ce = 0.0
+        total_count = 0
+        obs_ce = 0.0
+        obs_count = 0
+        nonobs_ce = 0.0
+        nonobs_count = 0
+
+        for _ in range(args.steps_per_epoch):
+            x_t, x_tp1 = sample_batch(seqs, args.batch_size)
+            x_t_t = torch.as_tensor(x_t, dtype=torch.long, device=device)
+            x_tp1_t = torch.as_tensor(x_tp1, dtype=torch.long, device=device)
+
+            states = []
+            for i in range(args.agents):
+                if is_observer[i]:
+                    s_i = agents[i].encode(x_t_t)
+                else:
+                    s_i = agents[i].encoder(torch.zeros((args.batch_size, args.embed_dim), device=device))
+                states.append(s_i)
+            states = torch.stack(states, dim=0)  # [A, B, state_dim]
+
+            loss = 0.0
+            step_ce = []
+            for i in range(args.agents):
+                neigh = graph.neighbors[i]
+                neigh_states = states[neigh].permute(1, 0, 2)  # [B, N, state_dim]
+                logits = agents[i].predict_next(states[i], neigh_states)
+                ce = F.cross_entropy(logits, x_tp1_t, reduction="mean")
+                loss = loss + ce
+                step_ce.append(ce.item())
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            for i, ce_val in enumerate(step_ce):
+                total_ce += ce_val
+                total_count += 1
+                if is_observer[i]:
+                    obs_ce += ce_val
+                    obs_count += 1
+                else:
+                    nonobs_ce += ce_val
+                    nonobs_count += 1
+
+        if ep % args.log_interval == 0:
+            total_avg = total_ce / max(1, total_count)
+            obs_avg = obs_ce / max(1, obs_count)
+            nonobs_avg = nonobs_ce / max(1, nonobs_count)
+            print(
+                f"Ep {ep:4d} | CE observers: {obs_avg:.4f} | "
+                f"CE non-observers: {nonobs_avg:.4f} | CE total: {total_avg:.4f}"
+            )
+
+
+if __name__ == "__main__":
+    main()
