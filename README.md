@@ -19,7 +19,7 @@ conda activate emergent-multiagent
 ## Run
 
 ```bash
-conda run -n emergent-multiagent python experiment.py
+python experiment.py
 ```
 
 ## Notes
@@ -66,7 +66,7 @@ conda run -n emergent-multiagent python experiment.py
 A small language-modeling variant with an RNN-style alignment: agent i sees token t_i and predicts token t_{i+1} within a sampled window of length agents+1. Observer agents receive their token; non-observers get zero input but still predict for evaluation. Sentences must be long enough for the chosen number of agents (or use --sequence-mode stream to concatenate).
 
 ```bash
-conda run -n emergent-multiagent python language_experiment.py
+python language_experiment.py
 ```
 
 Useful flags:
