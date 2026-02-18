@@ -7,7 +7,7 @@ This repo contains a simple multi-agent experiment where agents receive partial 
 Create the conda environment:
 
 ```bash
-conda env create -f "/Users/sebastianstapf/Documents/New project/environment.yml"
+conda env create -f "/Users/sebastianstapf/Documents/emergent_world_models/environment.yml"
 ```
 
 Activate it (if your conda registry isn't writable, activate by path):
@@ -19,7 +19,7 @@ conda activate /opt/homebrew/anaconda3/envs/emergent-multiagent
 ## Run
 
 ```bash
-conda run -n emergent-multiagent python "/Users/sebastianstapf/Documents/New project/experiment.py"
+conda run -n emergent-multiagent python "/Users/sebastianstapf/Documents/emergent_world_models/experiment.py"
 ```
 
 ## Notes
