@@ -969,8 +969,10 @@ def fit_ridge_regression(x: torch.Tensor, y: torch.Tensor, l2: float) -> torch.T
 
 
 def ridge_predict(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    ones = torch.ones((x.shape[0], 1), dtype=x.dtype)
+    ones = torch.ones((x.shape[0], 1), dtype=x.dtype, device=x.device)
     x_bias = torch.cat([x, ones], dim=1)
+    if w.device != x_bias.device:
+        w = w.to(x_bias.device)
     return x_bias @ w
 
 
