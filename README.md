@@ -129,3 +129,38 @@ Torchtext install:
 ```bash
 conda install -c conda-forge torchtext
 ```
+
+## Distributed Local World Model experiment
+
+New experiment for your hypothesis: agents only optimize local predictive objectives (own patch + neighbors), then we test whether all agent latents jointly encode the full environment.
+
+```bash
+python distributed_local_world_model_experiment.py
+```
+
+What it does:
+
+- Environment: synthetic diffusion field on a 2D grid (local coupling only).
+- Agents: one per grid cell, 4-neighbor communication graph.
+- Training losses:
+  - sensing agents predict their own next local patch (`--lambda-self`).
+  - all agents predict neighbors' next latent states (`--lambda-neighbor`).
+- Evaluation: freeze the model, train a linear probe from all agent latents to the full global grid state.
+- Optional blind-vs-observer analysis: per-agent probe quality (`--skip-agent-probes` to disable).
+
+Useful flags:
+
+```bash
+--grid-size 8
+--patch-radius 1
+--observer-frac 0.5
+--latent-dim 16
+--epochs 40
+--steps-per-epoch 40
+--lambda-self 1.0
+--lambda-neighbor 1.0
+--disable-messages          # ablation: no communication
+--probe-train-batches 24
+--probe-test-batches 12
+--agent-probe-max-agents 0
+```
