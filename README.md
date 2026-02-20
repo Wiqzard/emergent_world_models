@@ -216,6 +216,7 @@ Visualization:
   - `outputs/gym_pixel_prediction_comparison.png` (or `--pixel-plot-file`),
   - row 1 = true next frames, row 2 = predicted next frames.
 - `--pixel-horizon` controls how many macro-steps ahead the pixel target is (`t+K`).
+  - For `t+K`, the pixel probe is conditioned on the intermediate executed action window (`t ... t+K-1`) as an averaged action context.
 - For classic-control pixel rendering (`CartPole-v1`, `Acrobot-v1`), `pygame` is required (now included in `environment.yml`).
 
 Pixel comparison run example:

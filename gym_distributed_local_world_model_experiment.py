@@ -722,7 +722,10 @@ def collect_pixel_probe_dataset(
                 edge_feat=graph.edge_feat,
                 disable_messages=disable_messages,
             )
-            global_x.append(z.reshape(b, -1).cpu())
+            # Condition pixel probe on the intermediate action window needed for t+K prediction.
+            action_window = actions[:, t : t + pixel_horizon].mean(dim=1)
+            feat = torch.cat([z.reshape(b, -1), action_window], dim=-1)
+            global_x.append(feat.cpu())
             target_idx = t + pixel_horizon - 1
             pixel_targets.append(pixel_vecs[:, target_idx].cpu())
 
