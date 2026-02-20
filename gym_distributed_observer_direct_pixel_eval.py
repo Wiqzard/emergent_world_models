@@ -124,8 +124,9 @@ def collect_direct_observer_pixel_sequences(
             disable_messages=disable_messages,
         )
 
-        # Directly use observer predictions: weighted merge over observer agents only.
-        obs_weights = obs_mask.unsqueeze(-1) * state_mask
+        # Directly use observer predictions over the full observation vector.
+        # This aggregates all observer self-head outputs (not only their masked input dims).
+        obs_weights = obs_mask.unsqueeze(-1)
         numer = (self_pred * obs_weights).sum(dim=1)
         denom = obs_weights.sum(dim=1).clamp(min=1e-6)
         merged_pred = numer / denom
