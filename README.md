@@ -142,11 +142,17 @@ What it does:
 
 - Environment: synthetic diffusion field on a 2D grid (local coupling only).
 - Agents: one per grid cell, 4-neighbor communication graph.
+- Blindness is first-class: each identity has an observation mask that is fed into the recurrent update.
+- Learnable identity embeddings are used in latent initialization, updates, and message functions.
+- Messages are identity-conditioned and include relative edge features (`dx`, `dy`).
 - Training losses:
   - sensing agents predict their own next local patch (`--lambda-self`).
   - all agents predict neighbors' next latent states (`--lambda-neighbor`).
+- Optional blind-latent stability regularizer (`--blind-reg-weight`).
+- Optional anti-cheat setup: permute identity-to-position assignment each rollout (`--permute-agent-positions`).
 - Evaluation: freeze the model, train a linear probe from all agent latents to the full global grid state.
-- Optional blind-vs-observer analysis: per-agent probe quality (`--skip-agent-probes` to disable).
+- Reports global probe MSE/R2 plus reconstruction split on observed vs blind cells.
+- Optional per-agent probe quality is available when positions are not permuted (`--skip-agent-probes` to disable).
 
 Useful flags:
 
@@ -155,11 +161,14 @@ Useful flags:
 --patch-radius 1
 --observer-frac 0.5
 --latent-dim 16
+--id-dim 8
 --epochs 40
 --steps-per-epoch 40
 --lambda-self 1.0
 --lambda-neighbor 1.0
+--blind-reg-weight 1e-3
 --disable-messages          # ablation: no communication
+--permute-agent-positions   # anti-cheat: random identity-to-position assignment
 --probe-train-batches 24
 --probe-test-batches 12
 --agent-probe-max-agents 0
