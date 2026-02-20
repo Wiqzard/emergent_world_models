@@ -701,7 +701,7 @@ def preprocess_frames_to_vectors(
 
 
 @torch.no_grad()
-def collect_pixel_probe_dataset(
+def collect_pixel_probe_dataset_multi_h(
     model: DistributedGymWorldModel,
     rollout: GymBatchRollout,
     num_batches: int,
@@ -714,18 +714,20 @@ def collect_pixel_probe_dataset(
     permute_agent_positions: bool,
     pixel_height: int,
     pixel_width: int,
-    pixel_horizon: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    max_horizon: int,
+) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
     model.eval()
-    global_x = []
-    pixel_targets = []
+    if max_horizon < 1:
+        raise ValueError("max_horizon must be >= 1")
+    global_x_by_h: Dict[int, List[torch.Tensor]] = {h: [] for h in range(1, max_horizon + 1)}
+    pixel_targets_by_h: Dict[int, List[torch.Tensor]] = {h: [] for h in range(1, max_horizon + 1)}
 
     num_agents = base_observer_mask.shape[0]
     obs_dim = base_state_mask.shape[1]
 
     for _ in range(num_batches):
         states_np, actions_np, frames_np = rollout.sample_rollout(
-            seq_len_plus_one=seq_len + pixel_horizon,
+            seq_len_plus_one=seq_len + max_horizon,
             include_frames=True,
         )
         if frames_np is None:
@@ -763,14 +765,22 @@ def collect_pixel_probe_dataset(
                 edge_feat=graph.edge_feat,
                 disable_messages=disable_messages,
             )
-            # Condition pixel probe on the intermediate action window needed for t+K prediction.
-            action_window = actions[:, t : t + pixel_horizon].mean(dim=1)
-            feat = torch.cat([z.reshape(b, -1), action_window], dim=-1)
-            global_x.append(feat.cpu())
-            target_idx = t + pixel_horizon - 1
-            pixel_targets.append(pixel_vecs[:, target_idx].cpu())
+            z_flat = z.reshape(b, -1)
+            for h in range(1, max_horizon + 1):
+                # For t+h prediction, include the full intermediate action context.
+                action_window = actions[:, t : t + h].mean(dim=1)
+                feat = torch.cat([z_flat, action_window], dim=-1)
+                target_idx = t + h - 1
+                global_x_by_h[h].append(feat.cpu())
+                pixel_targets_by_h[h].append(pixel_vecs[:, target_idx].cpu())
 
-    return torch.cat(global_x, dim=0), torch.cat(pixel_targets, dim=0)
+    out: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+    for h in range(1, max_horizon + 1):
+        out[h] = (
+            torch.cat(global_x_by_h[h], dim=0),
+            torch.cat(pixel_targets_by_h[h], dim=0),
+        )
+    return out
 
 
 def fit_ridge_regression(x: torch.Tensor, y: torch.Tensor, l2: float) -> torch.Tensor:
@@ -824,8 +834,7 @@ def evaluate_agent_probes(
 
 
 def create_pixel_prediction_plot(
-    y_true: torch.Tensor,
-    y_pred: torch.Tensor,
+    horizon_to_true_pred: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
     pixel_height: int,
     pixel_width: int,
     output_path: str,
@@ -838,25 +847,37 @@ def create_pixel_prediction_plot(
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    n = min(max_frames, y_true.shape[0])
-    true_img = y_true[:n].reshape(n, 3, pixel_height, pixel_width).permute(0, 2, 3, 1).numpy()
-    pred_img = y_pred[:n].reshape(n, 3, pixel_height, pixel_width).permute(0, 2, 3, 1).numpy()
-    true_img = np.clip(true_img, 0.0, 1.0)
-    pred_img = np.clip(pred_img, 0.0, 1.0)
+    horizons = sorted(horizon_to_true_pred.keys())
+    if not horizons:
+        raise RuntimeError("No horizon predictions available for pixel plot.")
+    min_count = min(horizon_to_true_pred[h][0].shape[0] for h in horizons)
+    n = min(max_frames, min_count)
 
-    fig, axes = plt.subplots(2, n, figsize=(2.2 * n, 4.2))
-    if n == 1:
-        axes = np.array([[axes[0]], [axes[1]]])
+    rows = 2 * len(horizons)
+    fig, axes = plt.subplots(rows, n, figsize=(2.2 * n, 2.0 * rows))
+    axes = np.array(axes).reshape(rows, n)
 
-    for col in range(n):
-        axes[0, col].imshow(true_img[col])
-        axes[0, col].set_title(f"True t+1 #{col+1}", fontsize=9)
-        axes[0, col].axis("off")
-        axes[1, col].imshow(pred_img[col])
-        axes[1, col].set_title(f"Pred t+1 #{col+1}", fontsize=9)
-        axes[1, col].axis("off")
+    for h_idx, h in enumerate(horizons):
+        y_true_h, y_pred_h = horizon_to_true_pred[h]
+        true_img = y_true_h[:n].reshape(n, 3, pixel_height, pixel_width).permute(0, 2, 3, 1).numpy()
+        pred_img = y_pred_h[:n].reshape(n, 3, pixel_height, pixel_width).permute(0, 2, 3, 1).numpy()
+        true_img = np.clip(true_img, 0.0, 1.0)
+        pred_img = np.clip(pred_img, 0.0, 1.0)
 
-    fig.suptitle("Global Pixel Prediction From Distributed Latent", fontsize=11)
+        true_row = 2 * h_idx
+        pred_row = true_row + 1
+        for col in range(n):
+            axes[true_row, col].imshow(true_img[col])
+            axes[true_row, col].axis("off")
+            axes[pred_row, col].imshow(pred_img[col])
+            axes[pred_row, col].axis("off")
+            if h_idx == 0:
+                axes[true_row, col].set_title(f"#{col + 1}", fontsize=9)
+
+        axes[true_row, 0].set_ylabel(f"True t+{h}", fontsize=9)
+        axes[pred_row, 0].set_ylabel(f"Pred t+{h}", fontsize=9)
+
+    fig.suptitle("Global Pixel Predictions Across Horizons", fontsize=11)
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
@@ -1213,8 +1234,8 @@ def main() -> None:
         if pixel_probe_train_rollout is None or pixel_probe_test_rollout is None:
             raise RuntimeError("Pixel probe enabled but pixel rollouts were not initialized.")
 
-        print("Collecting pixel datasets for global latent->pixel probe...")
-        x_pix_train, y_pix_train = collect_pixel_probe_dataset(
+        print(f"Collecting pixel datasets for horizons 1..{args.pixel_horizon}...")
+        pixel_train_sets = collect_pixel_probe_dataset_multi_h(
             model=model,
             rollout=pixel_probe_train_rollout,
             num_batches=args.pixel_probe_train_batches,
@@ -1227,9 +1248,9 @@ def main() -> None:
             permute_agent_positions=args.permute_agent_positions,
             pixel_height=args.pixel_height,
             pixel_width=args.pixel_width,
-            pixel_horizon=args.pixel_horizon,
+            max_horizon=args.pixel_horizon,
         )
-        x_pix_test, y_pix_test = collect_pixel_probe_dataset(
+        pixel_test_sets = collect_pixel_probe_dataset_multi_h(
             model=model,
             rollout=pixel_probe_test_rollout,
             num_batches=args.pixel_probe_test_batches,
@@ -1242,37 +1263,50 @@ def main() -> None:
             permute_agent_positions=args.permute_agent_positions,
             pixel_height=args.pixel_height,
             pixel_width=args.pixel_width,
-            pixel_horizon=args.pixel_horizon,
+            max_horizon=args.pixel_horizon,
         )
 
-        w_pix = fit_ridge_regression(x_pix_train, y_pix_train, l2=args.pixel_probe_l2)
-        y_pix_train_pred = ridge_predict(x_pix_train, w_pix)
-        y_pix_test_pred = ridge_predict(x_pix_test, w_pix)
-        pixel_train_mse = mse_value(y_pix_train_pred, y_pix_train)
-        pixel_test_mse = mse_value(y_pix_test_pred, y_pix_test)
-        pixel_baseline = y_pix_train.mean(dim=0, keepdim=True)
-        pixel_baseline_mse = mse_value(pixel_baseline.expand_as(y_pix_test), y_pix_test)
-        pixel_sse = torch.sum((y_pix_test_pred - y_pix_test) ** 2)
-        pixel_sst = torch.sum((y_pix_test - y_pix_test.mean(dim=0, keepdim=True)) ** 2).clamp(min=1e-8)
-        pixel_r2 = float((1.0 - pixel_sse / pixel_sst).item())
+        print("Pixel probe results by horizon:")
+        horizon_to_true_pred: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        for h in range(1, args.pixel_horizon + 1):
+            x_pix_train, y_pix_train = pixel_train_sets[h]
+            x_pix_test, y_pix_test = pixel_test_sets[h]
 
-        final_metrics["pixel_train_mse"] = pixel_train_mse
-        final_metrics["pixel_test_mse"] = pixel_test_mse
-        final_metrics["pixel_baseline_test_mse"] = pixel_baseline_mse
-        final_metrics["pixel_test_r2"] = pixel_r2
+            w_pix_h = fit_ridge_regression(x_pix_train, y_pix_train, l2=args.pixel_probe_l2)
+            y_pix_train_pred = ridge_predict(x_pix_train, w_pix_h)
+            y_pix_test_pred = ridge_predict(x_pix_test, w_pix_h)
+            pixel_train_mse = mse_value(y_pix_train_pred, y_pix_train)
+            pixel_test_mse = mse_value(y_pix_test_pred, y_pix_test)
+            pixel_baseline = y_pix_train.mean(dim=0, keepdim=True)
+            pixel_baseline_mse = mse_value(pixel_baseline.expand_as(y_pix_test), y_pix_test)
+            pixel_sse = torch.sum((y_pix_test_pred - y_pix_test) ** 2)
+            pixel_sst = torch.sum((y_pix_test - y_pix_test.mean(dim=0, keepdim=True)) ** 2).clamp(min=1e-8)
+            pixel_r2 = float((1.0 - pixel_sse / pixel_sst).item())
 
-        print(f"Pixel probe results (global latent -> RGB frame at t+{args.pixel_horizon} macro-steps):")
-        print(f"- pixel_train_mse: {pixel_train_mse:.6f}")
-        print(f"- pixel_test_mse: {pixel_test_mse:.6f}")
-        print(f"- pixel_test_mse_baseline(mean): {pixel_baseline_mse:.6f}")
-        print(f"- pixel_test_r2: {pixel_r2:.6f}")
+            final_metrics[f"pixel_h{h}_train_mse"] = pixel_train_mse
+            final_metrics[f"pixel_h{h}_test_mse"] = pixel_test_mse
+            final_metrics[f"pixel_h{h}_baseline_test_mse"] = pixel_baseline_mse
+            final_metrics[f"pixel_h{h}_test_r2"] = pixel_r2
+            if h == args.pixel_horizon:
+                # Backward-compatible summary fields (now equal to the furthest horizon).
+                final_metrics["pixel_train_mse"] = pixel_train_mse
+                final_metrics["pixel_test_mse"] = pixel_test_mse
+                final_metrics["pixel_baseline_test_mse"] = pixel_baseline_mse
+                final_metrics["pixel_test_r2"] = pixel_r2
+
+            horizon_to_true_pred[h] = (y_pix_test, y_pix_test_pred)
+            print(
+                f"- h={h}: train_mse={pixel_train_mse:.6f} "
+                f"test_mse={pixel_test_mse:.6f} "
+                f"baseline={pixel_baseline_mse:.6f} "
+                f"r2={pixel_r2:.6f}"
+            )
 
         if plt is None:
             print("matplotlib is not installed; skipping pixel comparison image export.")
         else:
             create_pixel_prediction_plot(
-                y_true=y_pix_test,
-                y_pred=y_pix_test_pred,
+                horizon_to_true_pred=horizon_to_true_pred,
                 pixel_height=args.pixel_height,
                 pixel_width=args.pixel_width,
                 output_path=args.pixel_plot_file,
@@ -1306,6 +1340,11 @@ def main() -> None:
             log_payload["pixel_probe/test_mse"] = final_metrics["pixel_test_mse"]
             log_payload["pixel_probe/test_baseline_mse"] = final_metrics["pixel_baseline_test_mse"]
             log_payload["pixel_probe/test_r2"] = final_metrics["pixel_test_r2"]
+            for h in range(1, args.pixel_horizon + 1):
+                log_payload[f"pixel_probe/h{h}/train_mse"] = final_metrics[f"pixel_h{h}_train_mse"]
+                log_payload[f"pixel_probe/h{h}/test_mse"] = final_metrics[f"pixel_h{h}_test_mse"]
+                log_payload[f"pixel_probe/h{h}/test_baseline_mse"] = final_metrics[f"pixel_h{h}_baseline_test_mse"]
+                log_payload[f"pixel_probe/h{h}/test_r2"] = final_metrics[f"pixel_h{h}_test_r2"]
         if pixel_plot_saved:
             log_payload["plot/pixel_prediction"] = wandb.Image(args.pixel_plot_file)
         wandb.log(log_payload)

@@ -214,7 +214,9 @@ Visualization:
   - observer-vs-blind single-agent probe MSE (if enabled).
 - Optional pixel-level visualization (`--pixel-probe`) fits an additional latent->RGB-frame probe and saves:
   - `outputs/gym_pixel_prediction_comparison.png` (or `--pixel-plot-file`),
-  - row 1 = true next frames, row 2 = predicted next frames.
+  - for each horizon `h=1..pixel-horizon`, two rows are shown:
+    - `True t+h`
+    - `Pred t+h`
 - `--pixel-horizon` controls how many macro-steps ahead the pixel target is (`t+K`).
   - For `t+K`, the pixel probe is conditioned on the intermediate executed action window (`t ... t+K-1`) as an averaged action context.
 - For classic-control pixel rendering (`CartPole-v1`, `Acrobot-v1`), `pygame` is required (now included in `environment.yml`).
@@ -223,6 +225,8 @@ Pixel comparison run example:
 
 ```bash
 python gym_distributed_local_world_model_experiment.py --env CartPole-v1 --pixel-probe
+
+python gym_distributed_local_world_model_experiment.py --env MiniGrid-Dynamic-Obstacles-16x16-v0 --pixel-probe --wandb --wandb-project emergent-world-models --frame-skip 1 --pixel-horizon 2 --epochs 100
 ```
 
 Useful flags:
