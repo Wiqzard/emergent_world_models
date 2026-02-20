@@ -214,11 +214,15 @@ class GymBatchRollout:
         batch_size: int,
         seed: int,
         render_mode: Optional[str] = None,
+        frame_skip: int = 1,
     ):
         self.env_name = env_name
         self.batch_size = batch_size
         self.base_seed = seed
         self.render_mode = render_mode
+        if frame_skip < 1:
+            raise ValueError("frame_skip must be >= 1")
+        self.frame_skip = int(frame_skip)
         if render_mode is None:
             self.envs = [gym.make(env_name) for _ in range(batch_size)]
         else:
@@ -255,12 +259,19 @@ class GymBatchRollout:
             next_frames = [] if include_frames else None
 
             for i, env in enumerate(self.envs):
-                action = env.action_space.sample()
-                action_vecs[i] = action_to_vector(action, env.action_space)
-                obs_next, _, done, _ = env_step(env, action)
-                if done:
-                    reset_seed = self.base_seed + 100000 + self.step_count * self.batch_size + i
-                    obs_next = env_reset(env, seed=reset_seed)
+                action_acc = np.zeros((self.action_dim,), dtype=np.float32)
+                obs_next = self.current_obs[i]
+
+                for _ in range(self.frame_skip):
+                    action = env.action_space.sample()
+                    action_acc += action_to_vector(action, env.action_space)
+                    obs_next, _, done, _ = env_step(env, action)
+                    if done:
+                        reset_seed = self.base_seed + 100000 + self.step_count * self.batch_size + i
+                        obs_next = env_reset(env, seed=reset_seed)
+
+                # Keep action input compatible: same dimensionality, aggregated over executed actions.
+                action_vecs[i] = action_acc / float(self.frame_skip)
                 next_obs[i] = obs_next
                 if include_frames:
                     try:
@@ -662,6 +673,7 @@ def collect_pixel_probe_dataset(
     permute_agent_positions: bool,
     pixel_height: int,
     pixel_width: int,
+    pixel_horizon: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     model.eval()
     global_x = []
@@ -671,7 +683,10 @@ def collect_pixel_probe_dataset(
     obs_dim = base_state_mask.shape[1]
 
     for _ in range(num_batches):
-        states_np, actions_np, frames_np = rollout.sample_rollout(seq_len_plus_one=seq_len + 1, include_frames=True)
+        states_np, actions_np, frames_np = rollout.sample_rollout(
+            seq_len_plus_one=seq_len + pixel_horizon,
+            include_frames=True,
+        )
         if frames_np is None:
             raise RuntimeError("Pixel probe requested but no frames were captured from rollout.")
 
@@ -708,7 +723,8 @@ def collect_pixel_probe_dataset(
                 disable_messages=disable_messages,
             )
             global_x.append(z.reshape(b, -1).cpu())
-            pixel_targets.append(pixel_vecs[:, t].cpu())
+            target_idx = t + pixel_horizon - 1
+            pixel_targets.append(pixel_vecs[:, target_idx].cpu())
 
     return torch.cat(global_x, dim=0), torch.cat(pixel_targets, dim=0)
 
@@ -861,6 +877,7 @@ def main() -> None:
     parser.add_argument("--hidden-layers", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seq-len", type=int, default=10)
+    parser.add_argument("--frame-skip", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--steps-per-epoch", type=int, default=40)
     parser.add_argument("--eval-batches", type=int, default=8)
@@ -879,6 +896,7 @@ def main() -> None:
     parser.add_argument("--pixel-probe-batch-size", type=int, default=4)
     parser.add_argument("--pixel-height", type=int, default=84)
     parser.add_argument("--pixel-width", type=int, default=84)
+    parser.add_argument("--pixel-horizon", type=int, default=1)
     parser.add_argument("--pixel-probe-l2", type=float, default=1e-2)
     parser.add_argument("--pixel-vis-frames", type=int, default=6)
     parser.add_argument("--pixel-plot-file", type=str, default="outputs/gym_pixel_prediction_comparison.png")
@@ -896,14 +914,18 @@ def main() -> None:
         raise ValueError("--agents must be >= 2")
     if args.seq_len < 1:
         raise ValueError("--seq-len must be >= 1")
+    if args.frame_skip < 1:
+        raise ValueError("--frame-skip must be >= 1")
+    if args.pixel_horizon < 1:
+        raise ValueError("--pixel-horizon must be >= 1")
 
     set_seed(args.seed)
     device = resolve_device(args.device)
 
-    train_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 11)
-    eval_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 17)
-    probe_train_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 23)
-    probe_test_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 29)
+    train_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 11, frame_skip=args.frame_skip)
+    eval_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 17, frame_skip=args.frame_skip)
+    probe_train_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 23, frame_skip=args.frame_skip)
+    probe_test_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 29, frame_skip=args.frame_skip)
     pixel_probe_train_rollout = None
     pixel_probe_test_rollout = None
     if args.pixel_probe:
@@ -912,12 +934,14 @@ def main() -> None:
             args.pixel_probe_batch_size,
             seed=args.seed + 31,
             render_mode="rgb_array",
+            frame_skip=args.frame_skip,
         )
         pixel_probe_test_rollout = GymBatchRollout(
             args.env,
             args.pixel_probe_batch_size,
             seed=args.seed + 37,
             render_mode="rgb_array",
+            frame_skip=args.frame_skip,
         )
 
     obs_dim = train_rollout.obs_dim
@@ -969,6 +993,9 @@ def main() -> None:
     print(f"Permute identity-position: {args.permute_agent_positions}")
     print(f"Disable messages: {args.disable_messages}")
     print(f"Pixel probe enabled: {args.pixel_probe}")
+    print(f"Frame skip (macro-step): {args.frame_skip}")
+    if args.pixel_probe:
+        print(f"Pixel probe horizon (macro-steps ahead): {args.pixel_horizon}")
     print(
         "Loss weights: "
         f"self={args.lambda_self}, "
@@ -1156,6 +1183,7 @@ def main() -> None:
             permute_agent_positions=args.permute_agent_positions,
             pixel_height=args.pixel_height,
             pixel_width=args.pixel_width,
+            pixel_horizon=args.pixel_horizon,
         )
         x_pix_test, y_pix_test = collect_pixel_probe_dataset(
             model=model,
@@ -1170,6 +1198,7 @@ def main() -> None:
             permute_agent_positions=args.permute_agent_positions,
             pixel_height=args.pixel_height,
             pixel_width=args.pixel_width,
+            pixel_horizon=args.pixel_horizon,
         )
 
         w_pix = fit_ridge_regression(x_pix_train, y_pix_train, l2=args.pixel_probe_l2)
@@ -1188,7 +1217,7 @@ def main() -> None:
         final_metrics["pixel_baseline_test_mse"] = pixel_baseline_mse
         final_metrics["pixel_test_r2"] = pixel_r2
 
-        print("Pixel probe results (global latent -> next RGB frame):")
+        print(f"Pixel probe results (global latent -> RGB frame at t+{args.pixel_horizon} macro-steps):")
         print(f"- pixel_train_mse: {pixel_train_mse:.6f}")
         print(f"- pixel_test_mse: {pixel_test_mse:.6f}")
         print(f"- pixel_test_mse_baseline(mean): {pixel_baseline_mse:.6f}")

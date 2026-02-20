@@ -184,10 +184,11 @@ Useful flags:
 
 This variant uses a Gym environment (default: `Acrobot-v1`) and makes the signal flow explicit:
 
-- At each step, an action is sampled randomly from the environment action space.
+- At each macro-step, random actions are sampled from the environment action space.
+- `--frame-skip` controls how many env steps are executed per macro-step.
 - Only observer agents receive:
   - their assigned part of the current state (`--min-obs-dims` controls minimum visible dimensions),
-  - the sampled action vector.
+  - an action vector aggregated over the executed actions in that macro-step (same action dimensionality).
 - Blind agents receive no direct state/action input and must rely on neighbor messages.
 - The model is still trained only with local objectives (self local next-state prediction + neighbor latent prediction).
 - After training, a frozen global probe predicts full next state from all agents' latents.
@@ -214,6 +215,7 @@ Visualization:
 - Optional pixel-level visualization (`--pixel-probe`) fits an additional latent->RGB-frame probe and saves:
   - `outputs/gym_pixel_prediction_comparison.png` (or `--pixel-plot-file`),
   - row 1 = true next frames, row 2 = predicted next frames.
+- `--pixel-horizon` controls how many macro-steps ahead the pixel target is (`t+K`).
 - For classic-control pixel rendering (`CartPole-v1`, `Acrobot-v1`), `pygame` is required (now included in `environment.yml`).
 
 Pixel comparison run example:
@@ -234,6 +236,7 @@ Useful flags:
 --id-dim 8
 --batch-size 16
 --seq-len 10
+--frame-skip 4
 --epochs 50
 --steps-per-epoch 40
 --lambda-self 1.0
@@ -250,6 +253,7 @@ Useful flags:
 --pixel-probe-batch-size 4
 --pixel-height 84
 --pixel-width 84
+--pixel-horizon 4
 --pixel-plot-file outputs/gym_pixel_prediction_comparison.png
 --wandb
 ```
