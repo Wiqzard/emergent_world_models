@@ -23,6 +23,11 @@ except Exception:
     wandb = None
 
 try:
+    import imageio.v2 as imageio
+except Exception:
+    imageio = None
+
+try:
     import gymnasium as gym
 except Exception:
     import gym
@@ -1048,6 +1053,124 @@ def create_pixel_prediction_plot(
     plt.close(fig)
 
 
+@torch.no_grad()
+def collect_pixel_video_sequences(
+    model: DistributedGymWorldModel,
+    rollout: GymBatchRollout,
+    seq_len: int,
+    device: torch.device,
+    base_observer_mask: torch.Tensor,
+    base_state_mask: torch.Tensor,
+    graph: Graph,
+    disable_messages: bool,
+    permute_agent_positions: bool,
+    pixel_height: int,
+    pixel_width: int,
+    max_horizon: int,
+    video_env_index: int,
+    pixel_probe_weights: Dict[int, torch.Tensor],
+) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
+    model.eval()
+    states_np, actions_np, frames_np = rollout.sample_rollout(
+        seq_len_plus_one=seq_len + max_horizon,
+        include_frames=True,
+    )
+    if frames_np is None:
+        raise RuntimeError("Pixel video export requested but no frames were captured from rollout.")
+
+    states = torch.as_tensor(states_np, dtype=torch.float32, device=device)
+    actions = torch.as_tensor(actions_np, dtype=torch.float32, device=device)
+    pixel_vecs = preprocess_frames_to_vectors(frames_np, pixel_height=pixel_height, pixel_width=pixel_width, device=device)
+    b = states.shape[0]
+    if video_env_index < 0 or video_env_index >= b:
+        raise ValueError(f"--pixel-video-env-index must be in [0, {b - 1}] for current pixel probe batch size.")
+
+    num_agents = base_observer_mask.shape[0]
+    obs_dim = base_state_mask.shape[1]
+    identity_at_pos = sample_identity_assignments(
+        batch_size=b,
+        num_agents=num_agents,
+        permute_agent_positions=permute_agent_positions,
+        device=device,
+    )
+    obs_mask = base_observer_mask[identity_at_pos]
+    state_mask = base_state_mask[identity_at_pos]
+    id_features = model.identity_features(identity_at_pos)
+    z = model.initial_latent(id_features)
+
+    out_true: Dict[int, List[torch.Tensor]] = {h: [] for h in range(1, max_horizon + 1)}
+    out_pred: Dict[int, List[torch.Tensor]] = {h: [] for h in range(1, max_horizon + 1)}
+
+    for t in range(seq_len):
+        state_t = states[:, t]
+        action_t = actions[:, t]
+        state_local = state_t.unsqueeze(1).expand(b, num_agents, obs_dim) * state_mask
+        action_local = action_t.unsqueeze(1).expand(b, num_agents, action_t.shape[-1]) * obs_mask.unsqueeze(-1)
+        z, _, _ = model.step(
+            z_prev=z,
+            obs_local=state_local,
+            action_local=action_local,
+            obs_mask=obs_mask,
+            id_features=id_features,
+            neighbor_idx=graph.neighbor_idx,
+            neighbor_mask=graph.neighbor_mask,
+            edge_feat=graph.edge_feat,
+            disable_messages=disable_messages,
+        )
+        z_flat = z.reshape(b, -1)
+
+        for h in range(1, max_horizon + 1):
+            w_h = pixel_probe_weights[h]
+            action_window = actions[:, t : t + h].mean(dim=1)
+            feat = torch.cat([z_flat, action_window], dim=-1)
+            pred = ridge_predict(feat, w_h)
+            target_idx = t + h - 1
+            true = pixel_vecs[:, target_idx]
+            out_true[h].append(true[video_env_index].detach().cpu())
+            out_pred[h].append(pred[video_env_index].detach().cpu())
+
+    out: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+    for h in range(1, max_horizon + 1):
+        out[h] = (
+            torch.stack(out_true[h], dim=0),
+            torch.stack(out_pred[h], dim=0),
+        )
+    return out
+
+
+def frame_vectors_to_uint8(frames_vec: torch.Tensor, pixel_height: int, pixel_width: int) -> np.ndarray:
+    # frames_vec: [T, 3*H*W], values in [0,1]
+    img = frames_vec.reshape(frames_vec.shape[0], 3, pixel_height, pixel_width).permute(0, 2, 3, 1).numpy()
+    img = np.clip(img, 0.0, 1.0)
+    return (img * 255.0).astype(np.uint8)
+
+
+def save_side_by_side_mp4(
+    true_frames_vec: torch.Tensor,
+    pred_frames_vec: torch.Tensor,
+    pixel_height: int,
+    pixel_width: int,
+    output_path: str,
+    fps: int,
+) -> None:
+    if imageio is None:
+        raise RuntimeError(
+            "MP4 export requested but imageio is not installed. "
+            "Update env from environment.yml or install imageio and imageio-ffmpeg."
+        )
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    true_frames = frame_vectors_to_uint8(true_frames_vec, pixel_height, pixel_width)
+    pred_frames = frame_vectors_to_uint8(pred_frames_vec, pixel_height, pixel_width)
+    n = min(true_frames.shape[0], pred_frames.shape[0])
+    with imageio.get_writer(output_path, fps=max(1, int(fps)), codec="libx264", macro_block_size=1) as writer:
+        for t in range(n):
+            side = np.concatenate([true_frames[t], pred_frames[t]], axis=1)
+            writer.append_data(side)
+
+
 def create_metrics_plot(
     history: Dict[str, List[float]],
     final_metrics: Dict[str, float],
@@ -1139,6 +1262,10 @@ def main() -> None:
     parser.add_argument("--pixel-probe-l2", type=float, default=1e-2)
     parser.add_argument("--pixel-vis-frames", type=int, default=6)
     parser.add_argument("--pixel-plot-file", type=str, default="outputs/gym_pixel_prediction_comparison.png")
+    parser.add_argument("--save-pixel-mp4", action="store_true", help="Save horizon-wise true-vs-pred side-by-side MP4s.")
+    parser.add_argument("--pixel-mp4-prefix", type=str, default="outputs/gym_pixel_prediction")
+    parser.add_argument("--pixel-video-fps", type=int, default=6)
+    parser.add_argument("--pixel-video-env-index", type=int, default=0)
     parser.add_argument("--skip-agent-probes", action="store_true")
     parser.add_argument("--plot-file", type=str, default="outputs/gym_world_model_metrics.png")
     parser.add_argument("--wandb", action="store_true")
@@ -1251,6 +1378,7 @@ def main() -> None:
     print(f"Frame skip (macro-step): {args.frame_skip}")
     if args.pixel_probe:
         print(f"Pixel probe horizon (macro-steps ahead): {args.pixel_horizon}")
+        print(f"Save pixel MP4s: {args.save_pixel_mp4}")
     print(
         "Loss weights: "
         f"self={args.lambda_self}, "
@@ -1420,6 +1548,7 @@ def main() -> None:
         print(f"- blind_agent_probe_mse: {final_metrics['blind_agent_probe_mse']:.6f}")
 
     pixel_plot_saved = False
+    pixel_mp4_paths: List[str] = []
     if args.pixel_probe:
         if pixel_probe_train_rollout is None or pixel_probe_test_rollout is None:
             raise RuntimeError("Pixel probe enabled but pixel rollouts were not initialized.")
@@ -1458,11 +1587,13 @@ def main() -> None:
 
         print("Pixel probe results by horizon:")
         horizon_to_true_pred: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        pixel_probe_weights: Dict[int, torch.Tensor] = {}
         for h in range(1, args.pixel_horizon + 1):
             x_pix_train, y_pix_train = pixel_train_sets[h]
             x_pix_test, y_pix_test = pixel_test_sets[h]
 
             w_pix_h = fit_ridge_regression(x_pix_train, y_pix_train, l2=args.pixel_probe_l2)
+            pixel_probe_weights[h] = w_pix_h
             y_pix_train_pred = ridge_predict(x_pix_train, w_pix_h)
             y_pix_test_pred = ridge_predict(x_pix_test, w_pix_h)
             pixel_train_mse = mse_value(y_pix_train_pred, y_pix_train)
@@ -1505,6 +1636,37 @@ def main() -> None:
             pixel_plot_saved = True
             print(f"Saved pixel comparison: {args.pixel_plot_file}")
 
+        if args.save_pixel_mp4:
+            horizon_videos = collect_pixel_video_sequences(
+                model=model,
+                rollout=pixel_probe_test_rollout,
+                seq_len=args.seq_len,
+                device=device,
+                base_observer_mask=base_observer_mask,
+                base_state_mask=base_state_mask,
+                graph=graph,
+                disable_messages=args.disable_messages,
+                permute_agent_positions=args.permute_agent_positions,
+                pixel_height=args.pixel_height,
+                pixel_width=args.pixel_width,
+                max_horizon=args.pixel_horizon,
+                video_env_index=args.pixel_video_env_index,
+                pixel_probe_weights=pixel_probe_weights,
+            )
+            for h in range(1, args.pixel_horizon + 1):
+                out_path = f"{args.pixel_mp4_prefix}_h{h}.mp4"
+                true_h, pred_h = horizon_videos[h]
+                save_side_by_side_mp4(
+                    true_frames_vec=true_h,
+                    pred_frames_vec=pred_h,
+                    pixel_height=args.pixel_height,
+                    pixel_width=args.pixel_width,
+                    output_path=out_path,
+                    fps=args.pixel_video_fps,
+                )
+                pixel_mp4_paths.append(out_path)
+                print(f"Saved pixel MP4 (h={h}): {out_path}")
+
     plot_saved = False
     if plt is None:
         print("matplotlib is not installed; skipping plot export.")
@@ -1537,6 +1699,8 @@ def main() -> None:
                 log_payload[f"pixel_probe/h{h}/test_r2"] = final_metrics[f"pixel_h{h}_test_r2"]
         if pixel_plot_saved:
             log_payload["plot/pixel_prediction"] = wandb.Image(args.pixel_plot_file)
+        for idx, path in enumerate(pixel_mp4_paths, start=1):
+            log_payload[f"video/pixel_h{idx}"] = wandb.Video(path, fps=max(1, int(args.pixel_video_fps)), format="mp4")
         wandb.log(log_payload)
         wandb_run.finish()
 

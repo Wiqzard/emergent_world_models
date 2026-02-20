@@ -217,6 +217,8 @@ Visualization:
   - for each horizon `h=1..pixel-horizon`, two rows are shown:
     - `True t+h`
     - `Pred t+h`
+- Optional MP4 export (`--save-pixel-mp4`) writes side-by-side true/pred videos for each horizon:
+  - `outputs/gym_pixel_prediction_h1.mp4`, ..., `outputs/gym_pixel_prediction_hK.mp4`
 - `--pixel-horizon` controls how many macro-steps ahead the pixel target is (`t+K`).
   - For `t+K`, the pixel probe is conditioned on the intermediate executed action window (`t ... t+K-1`) as an averaged action context.
 - For classic-control pixel rendering (`CartPole-v1`, `Acrobot-v1`), `pygame` is required (now included in `environment.yml`).
@@ -263,6 +265,10 @@ Useful flags:
 --pixel-width 84
 --pixel-horizon 4
 --pixel-plot-file outputs/gym_pixel_prediction_comparison.png
+--save-pixel-mp4
+--pixel-mp4-prefix outputs/gym_pixel_prediction
+--pixel-video-fps 6
+--pixel-video-env-index 0
 --wandb
 ```
 
@@ -271,6 +277,7 @@ Sphere-style graph example with contiguous observer identities on the 2D sphere 
 ```bash
 python gym_distributed_local_world_model_experiment.py \
   --env MiniGrid-Dynamic-Obstacles-16x16-v0 \
+  --pixel-probe --wandb --wandb-project emergent-world-models --frame-skip 1 --pixel-horizon 8 \
   --agents 32 \
   --graph sphere \
   --graph-rows 8 \
