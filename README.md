@@ -303,6 +303,7 @@ This variant keeps the same training setup but changes evaluation to use observe
 - Observer agents optimize:
   - next local observation prediction (`self` loss),
   - next-neighbor latent prediction (`neighbor` loss).
+- Observer input coverage: by default, observer agents split the full observation vector evenly so their union covers the whole environment observation.
 - Non-observer agents optimize:
   - next-neighbor latent prediction only.
 - Pixel evaluation:

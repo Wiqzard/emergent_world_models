@@ -25,7 +25,6 @@ from gym_distributed_local_world_model_experiment import (
     flatten_observation,
     sample_identity_assignments,
     sample_observer_mask,
-    sample_state_part_masks,
     save_side_by_side_mp4,
     set_seed,
     resolve_device,
@@ -43,6 +42,26 @@ def infer_obs_image_shape_from_env(env) -> Optional[Tuple[int, int, int]]:
     if shape is not None and len(shape) == 3:
         return tuple(int(v) for v in shape)
     return None
+
+
+def build_even_cover_state_masks(
+    num_agents: int,
+    obs_dim: int,
+    observer_mask: torch.Tensor,
+    seed: int,
+    device: torch.device,
+) -> torch.Tensor:
+    masks = np.zeros((num_agents, obs_dim), dtype=np.float32)
+    observer_idx = np.flatnonzero(observer_mask.detach().cpu().numpy() > 0.5)
+    if observer_idx.size == 0:
+        return torch.as_tensor(masks, dtype=torch.float32, device=device)
+
+    rng = np.random.default_rng(seed + 101)
+    perm_dims = rng.permutation(obs_dim)
+    for rank, d in enumerate(perm_dims):
+        agent = int(observer_idx[rank % observer_idx.size])
+        masks[agent, int(d)] = 1.0
+    return torch.as_tensor(masks, dtype=torch.float32, device=device)
 
 
 def ensure_rgb_vectors(vec: torch.Tensor, h: int, w: int, c: int) -> torch.Tensor:
@@ -251,7 +270,12 @@ def main() -> None:
     parser.add_argument("--observer-frac", type=float, default=0.5)
     parser.add_argument("--observer-placement", type=str, default="cluster2d", choices=["auto", "random", "cluster2d"])
     parser.add_argument("--observer-full-view", action="store_true", help="Observers see full local observation vector.")
-    parser.add_argument("--min-obs-dims", type=int, default=2)
+    parser.add_argument(
+        "--min-obs-dims",
+        type=int,
+        default=2,
+        help="Compatibility flag in this variant (state coverage is split evenly across observers).",
+    )
     parser.add_argument("--latent-dim", type=int, default=32)
     parser.add_argument("--id-dim", type=int, default=8)
     parser.add_argument("--hidden-dim", type=int, default=96)
@@ -317,11 +341,10 @@ def main() -> None:
         graph=graph,
         observer_placement=args.observer_placement,
     )
-    base_state_mask = sample_state_part_masks(
+    base_state_mask = build_even_cover_state_masks(
         num_agents=args.agents,
         obs_dim=obs_dim,
         observer_mask=base_observer_mask,
-        min_obs_dims=args.min_obs_dims,
         seed=args.seed,
         device=device,
     )
@@ -357,6 +380,15 @@ def main() -> None:
     print(f"Obs dim: {obs_dim} | Action dim: {train_rollout.action_dim}")
     print(f"Graph: {args.graph}")
     print(f"Observers: {int(base_observer_mask.sum().item())} | Blind: {args.agents - int(base_observer_mask.sum().item())}")
+    observer_rows = base_state_mask[base_observer_mask > 0.5]
+    if observer_rows.numel() > 0:
+        per_obs = observer_rows.sum(dim=1)
+        covered = float((observer_rows.sum(dim=0) > 0.5).float().mean().item())
+        print(
+            "Observer state split: even cover "
+            f"(dims/observer min={int(per_obs.min().item())}, max={int(per_obs.max().item())}, "
+            f"global_coverage={covered:.3f})"
+        )
     print(f"Pixel horizon: {args.pixel_horizon}")
     print(f"Save pixel MP4s: {args.save_pixel_mp4}")
 
