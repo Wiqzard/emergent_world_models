@@ -448,9 +448,6 @@ def main() -> None:
                 f"baseline={pixel_metrics['pixel_direct/test_baseline_mse']:.6f} "
                 f"r2={pixel_metrics['pixel_direct/test_r2']:.6f}"
             )
-            print(f"Saved direct pixel plot: {plot_path}")
-            if args.save_pixel_mp4:
-                print(f"Saved direct pixel MP4: {mp4_path}")
 
             if wandb_run is not None:
                 payload = {"epoch": epoch}
