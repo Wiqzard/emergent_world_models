@@ -426,12 +426,18 @@ class GymBatchRollout:
         render_mode: Optional[str] = None,
         frame_skip: int = 1,
         minigrid_fully_obs: bool = False,
+        minigrid_rgb_obs: bool = False,
+        minigrid_rgb_tile_size: int = 8,
     ):
         self.env_name = env_name
         self.batch_size = batch_size
         self.base_seed = seed
         self.render_mode = render_mode
         self.minigrid_fully_obs = bool(minigrid_fully_obs)
+        self.minigrid_rgb_obs = bool(minigrid_rgb_obs)
+        self.minigrid_rgb_tile_size = int(minigrid_rgb_tile_size)
+        if self.minigrid_rgb_tile_size < 1:
+            raise ValueError("minigrid_rgb_tile_size must be >= 1")
         ensure_env_registered(env_name)
         if frame_skip < 1:
             raise ValueError("frame_skip must be >= 1")
@@ -455,6 +461,15 @@ class GymBatchRollout:
                         "minigrid_fully_obs=True requires minigrid wrappers to be available."
                     ) from exc
                 env = FullyObsWrapper(env)
+            if self.minigrid_rgb_obs and env_name.startswith("MiniGrid-"):
+                try:
+                    from minigrid.wrappers import RGBImgObsWrapper, ImgObsWrapper
+                except Exception as exc:
+                    raise RuntimeError(
+                        "minigrid_rgb_obs=True requires minigrid wrappers to be available."
+                    ) from exc
+                env = RGBImgObsWrapper(env, tile_size=self.minigrid_rgb_tile_size)
+                env = ImgObsWrapper(env)
             return env
 
         self.envs = [_make_env() for _ in range(batch_size)]

@@ -55,7 +55,8 @@ def infer_obs_image_shape_from_env(env) -> Optional[Tuple[int, int, int]]:
 
 
 def is_minigrid_symbolic_obs(env_name: str, img_shape: Tuple[int, int, int]) -> bool:
-    return env_name.startswith("MiniGrid-") and img_shape[2] == 3
+    # MiniGrid symbolic observations are low-resolution grids (e.g., 7x7 or 16x16) with 3 symbolic channels.
+    return env_name.startswith("MiniGrid-") and img_shape[2] == 3 and img_shape[0] <= 32 and img_shape[1] <= 32
 
 
 def preprocess_state_batch(
@@ -66,6 +67,9 @@ def preprocess_state_batch(
     # For MiniGrid symbolic image observations, normalize each channel to [0,1] with channel-specific scale.
     # flatten_observation() divides by 255, which makes targets extremely tiny and hurts optimization.
     if not is_minigrid_symbolic_obs(env_name, img_shape):
+        # RGB observations are typically uint8-like; normalize for stable optimization.
+        if float(states.max().item()) > 1.5:
+            return states / 255.0
         return states
     h, w, c = img_shape
     x = states.reshape(*states.shape[:-1], h, w, c)
@@ -507,6 +511,24 @@ def main() -> None:
         action="store_false",
         help="Disable MiniGrid full-grid observation wrapping.",
     )
+    parser.add_argument(
+        "--minigrid-rgb-obs",
+        dest="minigrid_rgb_obs",
+        action="store_true",
+        help="For MiniGrid envs, use rendered RGB observation tensors (recommended for less coarse predictions). Default: on.",
+    )
+    parser.add_argument(
+        "--no-minigrid-rgb-obs",
+        dest="minigrid_rgb_obs",
+        action="store_false",
+        help="Disable MiniGrid RGB observation wrapping and use symbolic channels.",
+    )
+    parser.add_argument(
+        "--minigrid-rgb-tile-size",
+        type=int,
+        default=4,
+        help="Tile size for MiniGrid RGB observations when --minigrid-rgb-obs is enabled.",
+    )
     parser.add_argument("--observer-full-view", action="store_true", help="Observers see full local observation vector.")
     parser.add_argument(
         "--min-obs-dims",
@@ -550,7 +572,7 @@ def main() -> None:
         action="store_false",
         help="Disable display-only contrast rescaling.",
     )
-    parser.set_defaults(display_auto_rescale=True)
+    parser.set_defaults(display_auto_rescale=True, minigrid_rgb_obs=True)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="emergent-world-models")
     parser.add_argument("--wandb-run-name", type=str, default=None)
@@ -574,6 +596,8 @@ def main() -> None:
         seed=args.seed + 11,
         frame_skip=args.frame_skip,
         minigrid_fully_obs=args.minigrid_fully_obs,
+        minigrid_rgb_obs=args.minigrid_rgb_obs,
+        minigrid_rgb_tile_size=args.minigrid_rgb_tile_size,
     )
     eval_rollout = GymBatchRollout(
         args.env,
@@ -581,6 +605,8 @@ def main() -> None:
         seed=args.seed + 17,
         frame_skip=args.frame_skip,
         minigrid_fully_obs=args.minigrid_fully_obs,
+        minigrid_rgb_obs=args.minigrid_rgb_obs,
+        minigrid_rgb_tile_size=args.minigrid_rgb_tile_size,
     )
     pixel_rollout = GymBatchRollout(
         args.env,
@@ -589,6 +615,8 @@ def main() -> None:
         frame_skip=args.frame_skip,
         render_mode="rgb_array",
         minigrid_fully_obs=args.minigrid_fully_obs,
+        minigrid_rgb_obs=args.minigrid_rgb_obs,
+        minigrid_rgb_tile_size=args.minigrid_rgb_tile_size,
     )
 
     img_shape = infer_obs_image_shape_from_env(train_rollout.envs[0])
@@ -651,6 +679,12 @@ def main() -> None:
     print(f"Env: {args.env}")
     print(f"Device: {device}")
     print(f"Obs dim: {obs_dim} | Action dim: {train_rollout.action_dim}")
+    if args.env.startswith("MiniGrid-"):
+        obs_mode = "rgb" if args.minigrid_rgb_obs else "symbolic"
+        print(
+            f"MiniGrid obs mode: {obs_mode} "
+            f"(fully_obs={args.minigrid_fully_obs}, rgb_tile_size={args.minigrid_rgb_tile_size})"
+        )
     print(f"Graph: {args.graph}")
     print(f"Observers: {int(base_observer_mask.sum().item())} | Blind: {args.agents - int(base_observer_mask.sum().item())}")
     observer_rows = base_state_mask[base_observer_mask > 0.5]
