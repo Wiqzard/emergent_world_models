@@ -150,45 +150,193 @@ class Graph:
     neighbor_idx: torch.Tensor
     neighbor_mask: torch.Tensor
     edge_feat: torch.Tensor
+    grid_rows: int = 0
+    grid_cols: int = 0
+    wrap_rows: bool = False
+    wrap_cols: bool = False
 
 
-def build_graph(num_agents: int, graph_type: str, device: torch.device) -> Graph:
-    if graph_type not in {"ring", "line"}:
-        raise ValueError("Only ring and line graphs are supported.")
+def infer_grid_shape(num_agents: int, graph_rows: int, graph_cols: int) -> Tuple[int, int]:
+    rows = int(graph_rows)
+    cols = int(graph_cols)
+    if rows > 0 and cols > 0:
+        if rows * cols != num_agents:
+            raise ValueError("--graph-rows * --graph-cols must equal --agents.")
+        return rows, cols
+    if rows > 0:
+        if num_agents % rows != 0:
+            raise ValueError("--agents must be divisible by --graph-rows.")
+        return rows, num_agents // rows
+    if cols > 0:
+        if num_agents % cols != 0:
+            raise ValueError("--agents must be divisible by --graph-cols.")
+        return num_agents // cols, cols
 
-    max_neighbors = 2
+    root = int(np.sqrt(num_agents))
+    best_rows = 1
+    for r in range(root, 0, -1):
+        if num_agents % r == 0:
+            best_rows = r
+            break
+    best_cols = num_agents // best_rows
+    return best_rows, best_cols
+
+
+def build_graph_from_lists(
+    neighbor_lists: List[List[int]],
+    edge_lists: List[List[List[float]]],
+    edge_feat_dim: int,
+    device: torch.device,
+    grid_rows: int = 0,
+    grid_cols: int = 0,
+    wrap_rows: bool = False,
+    wrap_cols: bool = False,
+) -> Graph:
+    num_agents = len(neighbor_lists)
+    max_neighbors = max((len(neigh) for neigh in neighbor_lists), default=1)
+    max_neighbors = max(1, max_neighbors)
+
     neighbor_idx = torch.full((num_agents, max_neighbors), -1, dtype=torch.long)
     neighbor_mask = torch.zeros((num_agents, max_neighbors), dtype=torch.float32)
-    edge_feat = torch.zeros((num_agents, max_neighbors, 1), dtype=torch.float32)
+    edge_feat = torch.zeros((num_agents, max_neighbors, edge_feat_dim), dtype=torch.float32)
 
     for i in range(num_agents):
-        if graph_type == "ring":
-            left = (i - 1) % num_agents
-            right = (i + 1) % num_agents
-            neighbor_idx[i, 0] = left
-            neighbor_idx[i, 1] = right
-            neighbor_mask[i, 0] = 1.0
-            neighbor_mask[i, 1] = 1.0
-            edge_feat[i, 0, 0] = -1.0
-            edge_feat[i, 1, 0] = 1.0
-        else:
-            if i - 1 >= 0:
-                neighbor_idx[i, 0] = i - 1
-                neighbor_mask[i, 0] = 1.0
-                edge_feat[i, 0, 0] = -1.0
-            if i + 1 < num_agents:
-                neighbor_idx[i, 1] = i + 1
-                neighbor_mask[i, 1] = 1.0
-                edge_feat[i, 1, 0] = 1.0
+        for slot, j in enumerate(neighbor_lists[i]):
+            neighbor_idx[i, slot] = int(j)
+            neighbor_mask[i, slot] = 1.0
+            edge_feat[i, slot] = torch.as_tensor(edge_lists[i][slot], dtype=torch.float32)
 
     return Graph(
         neighbor_idx=neighbor_idx.to(device),
         neighbor_mask=neighbor_mask.to(device),
         edge_feat=edge_feat.to(device),
+        grid_rows=grid_rows,
+        grid_cols=grid_cols,
+        wrap_rows=wrap_rows,
+        wrap_cols=wrap_cols,
     )
 
 
-def sample_observer_mask(num_agents: int, observer_frac: float, seed: int, device: torch.device) -> torch.Tensor:
+def build_graph(
+    num_agents: int,
+    graph_type: str,
+    device: torch.device,
+    graph_rows: int = 0,
+    graph_cols: int = 0,
+) -> Graph:
+    if graph_type in {"ring", "line"}:
+        neighbor_lists: List[List[int]] = [[] for _ in range(num_agents)]
+        edge_lists: List[List[List[float]]] = [[] for _ in range(num_agents)]
+        denom = float(max(1, num_agents - 1))
+        for i in range(num_agents):
+            if graph_type == "ring" or i - 1 >= 0:
+                left = (i - 1) % num_agents if graph_type == "ring" else i - 1
+                neighbor_lists[i].append(left)
+                edge_lists[i].append([-1.0 / denom, 0.0])
+            if graph_type == "ring" or i + 1 < num_agents:
+                right = (i + 1) % num_agents if graph_type == "ring" else i + 1
+                neighbor_lists[i].append(right)
+                edge_lists[i].append([1.0 / denom, 0.0])
+        return build_graph_from_lists(neighbor_lists, edge_lists, edge_feat_dim=2, device=device)
+
+    if graph_type not in {"grid", "torus", "sphere"}:
+        raise ValueError("Unsupported graph type.")
+
+    rows, cols = infer_grid_shape(num_agents=num_agents, graph_rows=graph_rows, graph_cols=graph_cols)
+    wrap_rows = graph_type == "torus"
+    wrap_cols = graph_type in {"torus", "sphere"}
+    denom_r = float(max(1, rows - 1))
+    denom_c = float(max(1, cols - 1))
+
+    neighbor_lists = [[] for _ in range(num_agents)]
+    edge_lists = [[] for _ in range(num_agents)]
+
+    directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    for r in range(rows):
+        for c in range(cols):
+            i = r * cols + c
+            for dr, dc in directions:
+                rr = r + dr
+                cc = c + dc
+                if wrap_rows:
+                    rr %= rows
+                if wrap_cols:
+                    cc %= cols
+                if not (0 <= rr < rows and 0 <= cc < cols):
+                    continue
+                j = rr * cols + cc
+                neighbor_lists[i].append(j)
+                edge_lists[i].append([float(dr) / denom_r, float(dc) / denom_c])
+
+    return build_graph_from_lists(
+        neighbor_lists=neighbor_lists,
+        edge_lists=edge_lists,
+        edge_feat_dim=2,
+        device=device,
+        grid_rows=rows,
+        grid_cols=cols,
+        wrap_rows=wrap_rows,
+        wrap_cols=wrap_cols,
+    )
+
+
+def sample_cluster_indices_2d(
+    rows: int,
+    cols: int,
+    num_select: int,
+    seed: int,
+    wrap_rows: bool,
+    wrap_cols: bool,
+) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    if num_select <= 0:
+        return np.zeros((0,), dtype=np.int64)
+
+    start_r = int(rng.integers(rows))
+    start_c = int(rng.integers(cols))
+    frontier: List[Tuple[int, int]] = [(start_r, start_c)]
+    visited = set()
+    selected: List[int] = []
+    cursor = 0
+
+    while cursor < len(frontier) and len(selected) < num_select:
+        r, c = frontier[cursor]
+        cursor += 1
+        if (r, c) in visited:
+            continue
+        visited.add((r, c))
+        selected.append(r * cols + c)
+
+        dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        rng.shuffle(dirs)
+        for dr, dc in dirs:
+            rr = r + dr
+            cc = c + dc
+            if wrap_rows:
+                rr %= rows
+            if wrap_cols:
+                cc %= cols
+            if 0 <= rr < rows and 0 <= cc < cols and (rr, cc) not in visited:
+                frontier.append((rr, cc))
+
+    if len(selected) < num_select:
+        all_idx = np.arange(rows * cols, dtype=np.int64)
+        remaining = np.setdiff1d(all_idx, np.asarray(selected, dtype=np.int64), assume_unique=False)
+        rng.shuffle(remaining)
+        need = num_select - len(selected)
+        selected.extend(remaining[:need].tolist())
+
+    return np.asarray(selected, dtype=np.int64)
+
+
+def sample_observer_mask(
+    num_agents: int,
+    observer_frac: float,
+    seed: int,
+    device: torch.device,
+    graph: Graph,
+    observer_placement: str,
+) -> torch.Tensor:
     observer_frac = float(np.clip(observer_frac, 0.0, 1.0))
     num_observers = int(round(num_agents * observer_frac))
     if observer_frac > 0.0 and num_observers == 0:
@@ -198,7 +346,24 @@ def sample_observer_mask(num_agents: int, observer_frac: float, seed: int, devic
     mask = np.zeros(num_agents, dtype=np.float32)
     if num_observers > 0:
         rng = np.random.default_rng(seed)
-        chosen = rng.choice(num_agents, size=num_observers, replace=False)
+        resolved_placement = observer_placement
+        if observer_placement == "auto":
+            if graph.grid_rows > 0 and graph.grid_cols > 0 and graph.wrap_cols:
+                resolved_placement = "cluster2d"
+            else:
+                resolved_placement = "random"
+
+        if resolved_placement == "cluster2d" and graph.grid_rows > 0 and graph.grid_cols > 0:
+            chosen = sample_cluster_indices_2d(
+                rows=graph.grid_rows,
+                cols=graph.grid_cols,
+                num_select=num_observers,
+                seed=seed + 37,
+                wrap_rows=graph.wrap_rows,
+                wrap_cols=graph.wrap_cols,
+            )
+        else:
+            chosen = rng.choice(num_agents, size=num_observers, replace=False)
         mask[chosen] = 1.0
     return torch.as_tensor(mask, dtype=torch.float32, device=device)
 
@@ -933,8 +1098,17 @@ def main() -> None:
     )
     parser.add_argument("--env", type=str, default="Acrobot-v1")
     parser.add_argument("--agents", type=int, default=32)
-    parser.add_argument("--graph", type=str, default="ring", choices=["ring", "line"])
+    parser.add_argument("--graph", type=str, default="ring", choices=["ring", "line", "grid", "torus", "sphere"])
+    parser.add_argument("--graph-rows", type=int, default=0, help="Optional rows for 2D graphs (grid/torus/sphere).")
+    parser.add_argument("--graph-cols", type=int, default=0, help="Optional cols for 2D graphs (grid/torus/sphere).")
     parser.add_argument("--observer-frac", type=float, default=0.5)
+    parser.add_argument(
+        "--observer-placement",
+        type=str,
+        default="auto",
+        choices=["auto", "random", "cluster2d"],
+        help="Observer identity placement strategy.",
+    )
     parser.add_argument("--min-obs-dims", type=int, default=2)
     parser.add_argument("--latent-dim", type=int, default=32)
     parser.add_argument("--id-dim", type=int, default=8)
@@ -1012,7 +1186,21 @@ def main() -> None:
     obs_dim = train_rollout.obs_dim
     action_dim = train_rollout.action_dim
 
-    base_observer_mask = sample_observer_mask(args.agents, args.observer_frac, args.seed, device)
+    graph = build_graph(
+        args.agents,
+        args.graph,
+        device=device,
+        graph_rows=args.graph_rows,
+        graph_cols=args.graph_cols,
+    )
+    base_observer_mask = sample_observer_mask(
+        args.agents,
+        args.observer_frac,
+        args.seed,
+        device,
+        graph=graph,
+        observer_placement=args.observer_placement,
+    )
     base_state_mask = sample_state_part_masks(
         num_agents=args.agents,
         obs_dim=obs_dim,
@@ -1021,7 +1209,6 @@ def main() -> None:
         seed=args.seed,
         device=device,
     )
-    graph = build_graph(args.agents, args.graph, device=device)
 
     model = DistributedGymWorldModel(
         num_agents=args.agents,
@@ -1054,7 +1241,10 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Obs dim: {obs_dim} | Action dim: {action_dim}")
     print(f"Agents: {args.agents} | Graph: {args.graph}")
+    if graph.grid_rows > 0 and graph.grid_cols > 0:
+        print(f"Graph shape: {graph.grid_rows}x{graph.grid_cols} (wrap_rows={graph.wrap_rows}, wrap_cols={graph.wrap_cols})")
     print(f"Observers: {num_observers} | Blind: {num_blind}")
+    print(f"Observer placement: {args.observer_placement}")
     print(f"Permute identity-position: {args.permute_agent_positions}")
     print(f"Disable messages: {args.disable_messages}")
     print(f"Pixel probe enabled: {args.pixel_probe}")

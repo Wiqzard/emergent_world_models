@@ -234,8 +234,11 @@ Useful flags:
 ```bash
 --env Acrobot-v1
 --agents 32
---graph ring|line
+--graph ring|line|grid|torus|sphere
+--graph-rows 8
+--graph-cols 4
 --observer-frac 0.5
+--observer-placement auto|random|cluster2d
 --min-obs-dims 2
 --latent-dim 32
 --id-dim 8
@@ -261,4 +264,16 @@ Useful flags:
 --pixel-horizon 4
 --pixel-plot-file outputs/gym_pixel_prediction_comparison.png
 --wandb
+```
+
+Sphere-style graph example with contiguous observer identities on the 2D sphere chart:
+
+```bash
+python gym_distributed_local_world_model_experiment.py \
+  --env MiniGrid-Dynamic-Obstacles-16x16-v0 \
+  --agents 32 \
+  --graph sphere \
+  --graph-rows 8 \
+  --graph-cols 4 \
+  --observer-placement cluster2d
 ```
