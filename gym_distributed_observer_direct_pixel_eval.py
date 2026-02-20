@@ -22,7 +22,6 @@ from gym_distributed_local_world_model_experiment import (
     build_graph,
     compute_sequence_loss,
     evaluate_model,
-    flatten_observation,
     sample_identity_assignments,
     sample_observer_mask,
     save_side_by_side_mp4,
@@ -43,24 +42,130 @@ def infer_obs_image_shape_from_env(env) -> Optional[Tuple[int, int, int]]:
         return tuple(int(v) for v in shape)
     return None
 
-
-def build_even_cover_state_masks(
+def build_image_patch_state_masks_full_cover(
     num_agents: int,
-    obs_dim: int,
+    img_shape: Tuple[int, int, int],
     observer_mask: torch.Tensor,
     seed: int,
     device: torch.device,
 ) -> torch.Tensor:
+    """
+    Tile the full image into EXACTLY n_observers rectangles (no gaps, no overlaps),
+    and assign one rectangle to each observer. Non-observers get all zeros.
+    """
+    h, w, c = img_shape
+    obs_dim = h * w * c
     masks = np.zeros((num_agents, obs_dim), dtype=np.float32)
+
     observer_idx = np.flatnonzero(observer_mask.detach().cpu().numpy() > 0.5)
-    if observer_idx.size == 0:
+    n_obs = int(observer_idx.size)
+    if n_obs == 0:
         return torch.as_tensor(masks, dtype=torch.float32, device=device)
 
     rng = np.random.default_rng(seed + 101)
-    perm_dims = rng.permutation(obs_dim)
-    for rank, d in enumerate(perm_dims):
-        agent = int(observer_idx[rank % observer_idx.size])
-        masks[agent, int(d)] = 1.0
+    perm_obs = observer_idx[rng.permutation(n_obs)]
+
+    # Choose number of rows R, then distribute observers across rows:
+    # counts per row differ by at most 1, total = n_obs.
+    R = int(np.floor(np.sqrt(n_obs)))
+    R = max(1, min(R, h))  # can't have more rows than pixels
+    # If R is too small, bump until we can distribute nicely (optional; usually fine).
+    # We'll just distribute anyway.
+
+    base = n_obs // R
+    rem = n_obs % R
+    obs_per_row = [base + (1 if r < rem else 0) for r in range(R)]  # sums to n_obs
+
+    # Split height into R strips
+    ys = np.linspace(0, h, R + 1, dtype=int)
+
+    def set_rect(agent: int, y0: int, y1: int, x0: int, x1: int):
+        # Fill mask for rectangle (y0:y1, x0:x1), all channels
+        for y in range(y0, y1):
+            row_base = (y * w) * c
+            for x in range(x0, x1):
+                idx0 = row_base + x * c
+                masks[agent, idx0:idx0 + c] = 1.0
+
+    k = 0
+    for r in range(R):
+        y0, y1 = int(ys[r]), int(ys[r + 1])
+        n_in_row = obs_per_row[r]
+        if n_in_row == 0:
+            continue
+
+        # Split width into n_in_row segments for this row
+        xs = np.linspace(0, w, n_in_row + 1, dtype=int)
+        for j in range(n_in_row):
+            agent = int(perm_obs[k])
+            k += 1
+            x0, x1 = int(xs[j]), int(xs[j + 1])
+            set_rect(agent, y0, y1, x0, x1)
+
+    state_mask = torch.as_tensor(masks, dtype=torch.float32, device=device)
+
+    # Hard sanity checks (fail fast if coverage ever breaks)
+    cover = state_mask.sum(dim=0)  # [obs_dim]
+    if not torch.all(cover > 0.5):
+        missing = int((cover <= 0.5).sum().item())
+        raise RuntimeError(f"State mask does not fully cover image! Missing dims: {missing}/{obs_dim}")
+    if torch.any(cover > 1.5):
+        overlap = int((cover > 1.5).sum().item())
+        raise RuntimeError(f"State mask has overlaps! Overlapping dims: {overlap}/{obs_dim}")
+
+    return state_mask
+def build_image_patch_state_masks(
+    num_agents: int,
+    img_shape: Tuple[int, int, int],
+    observer_mask: torch.Tensor,
+    seed: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Assign each observer agent one contiguous (rectangular) patch of the image.
+    Patch covers all channels. Non-observers get all zeros.
+    """
+    h, w, c = img_shape
+    obs_dim = h * w * c
+    masks = np.zeros((num_agents, obs_dim), dtype=np.float32)
+
+    observer_idx = np.flatnonzero(observer_mask.detach().cpu().numpy() > 0.5)
+    n_obs = int(observer_idx.size)
+    if n_obs == 0:
+        return torch.as_tensor(masks, dtype=torch.float32, device=device)
+
+    # Permute observer assignment for reproducibility / fairness
+    rng = np.random.default_rng(seed + 101)
+    perm_obs = observer_idx[rng.permutation(n_obs)]
+
+    # Choose a near-square grid of patches
+    grid_rows = int(np.ceil(np.sqrt(n_obs)))
+    grid_cols = int(np.ceil(n_obs / grid_rows))
+
+    # Evenly split pixels into grid_rows x grid_cols rectangles
+    ys = np.linspace(0, h, grid_rows + 1, dtype=int)
+    xs = np.linspace(0, w, grid_cols + 1, dtype=int)
+
+    def flat_index(y, x, ch):
+        return (y * w + x) * c + ch
+
+    for k, agent in enumerate(perm_obs):
+        r = k // grid_cols
+        cc = k % grid_cols
+        if r >= grid_rows:
+            break  # should not happen, but safe
+
+        y0, y1 = int(ys[r]), int(ys[r + 1])
+        x0, x1 = int(xs[cc]), int(xs[cc + 1])
+
+        # Fill mask for this rectangle (all channels)
+        for y in range(y0, y1):
+            base = (y * w + x0) * c
+            # vectorize x loop a bit
+            for x in range(x0, x1):
+                idx0 = (y * w + x) * c
+                masks[int(agent), idx0:idx0 + c] = 1.0
+
     return torch.as_tensor(masks, dtype=torch.float32, device=device)
 
 
@@ -129,8 +234,13 @@ def collect_direct_observer_pixel_sequences(
     for t in range(pixel_horizon):
         state_t = states[:, t]
         action_t = actions[:, t]
+
+        # Each agent receives only its patch (observers) or nothing (non-observers)
         state_local = state_t.unsqueeze(1).expand(b, num_agents, obs_dim) * state_mask
-        action_local = action_t.unsqueeze(1).expand(b, num_agents, action_t.shape[-1]) * obs_mask.unsqueeze(-1)
+
+        # Actions are global: give them to ALL agents (so blind agents can still predict neighbors well)
+        action_local = action_t.unsqueeze(1).expand(b, num_agents, action_t.shape[-1])
+
         z, self_pred, _ = model.step(
             z_prev=z,
             obs_local=state_local,
@@ -143,12 +253,11 @@ def collect_direct_observer_pixel_sequences(
             disable_messages=disable_messages,
         )
 
-        # Directly use observer predictions over the full observation vector.
-        # This aggregates all observer self-head outputs (not only their masked input dims).
-        obs_weights = obs_mask.unsqueeze(-1)
-        numer = (self_pred * obs_weights).sum(dim=1)
-        denom = obs_weights.sum(dim=1).clamp(min=1e-6)
-        merged_pred = numer / denom
+        # Stitch predicted patches:
+        # take each observer's prediction ONLY on its own patch, then sum into full frame.
+        numer = (self_pred * state_mask).sum(dim=1)
+        denom = state_mask.sum(dim=1).clamp(min=1e-6)
+        merged_pred = numer / denom  # per-dim average if overlaps; normally denom is 0 or 1
 
         pred_seq.append(merged_pred[video_env_index].detach().cpu())
         true_seq.append(states[:, t + 1][video_env_index].detach().cpu())
@@ -215,6 +324,7 @@ def run_direct_pixel_eval(
     mp4_path: str,
     mp4_fps: int,
     video_env_index: int,
+    display_auto_rescale: bool,
 ) -> Dict[str, float]:
     true_vec, pred_vec = collect_direct_observer_pixel_sequences(
         model=model,
@@ -228,7 +338,10 @@ def run_direct_pixel_eval(
         permute_agent_positions=permute_agent_positions,
         video_env_index=video_env_index,
     )
-    true_disp, pred_disp = rescale_for_display(true_vec, pred_vec)
+    if display_auto_rescale:
+        true_disp, pred_disp = rescale_for_display(true_vec, pred_vec)
+    else:
+        true_disp, pred_disp = true_vec, pred_vec
     mse = float(torch.mean((pred_vec - true_vec) ** 2).item())
     baseline = true_vec.mean(dim=0, keepdim=True)
     baseline_mse = float(torch.mean((baseline.expand_as(true_vec) - true_vec) ** 2).item())
@@ -299,6 +412,11 @@ def main() -> None:
     parser.add_argument("--pixel-mp4-prefix", type=str, default="outputs/direct_observer_pixels")
     parser.add_argument("--pixel-video-fps", type=int, default=3)
     parser.add_argument("--pixel-video-env-index", type=int, default=0)
+    parser.add_argument(
+        "--display-auto-rescale",
+        action="store_true",
+        help="Optional display-only contrast rescaling for PNG/MP4 (default: off).",
+    )
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="emergent-world-models")
     parser.add_argument("--wandb-run-name", type=str, default=None)
@@ -341,18 +459,26 @@ def main() -> None:
         graph=graph,
         observer_placement=args.observer_placement,
     )
-    base_state_mask = build_even_cover_state_masks(
+    if int(base_observer_mask.sum().item()) == 0:
+        raise ValueError("This variant requires at least one observer so full image can be partitioned across observers.")
+    #base_state_mask = build_image_patch_state_masks(
+    #    num_agents=args.agents,
+    #    img_shape=img_shape,
+    #    observer_mask=base_observer_mask,
+    #    seed=args.seed,
+    #    device=device,
+    #)
+    base_state_mask = build_image_patch_state_masks_full_cover(
         num_agents=args.agents,
-        obs_dim=obs_dim,
+        img_shape=img_shape,
         observer_mask=base_observer_mask,
         seed=args.seed,
         device=device,
     )
     if args.observer_full_view:
-        base_state_mask = torch.where(
-            base_observer_mask.unsqueeze(-1) > 0.5,
-            torch.ones_like(base_state_mask),
-            base_state_mask,
+        raise ValueError(
+            "--observer-full-view is incompatible with this variant: "
+            "observer inputs are enforced as a disjoint full-image patch partition."
         )
 
     model = DistributedGymWorldModel(
@@ -385,7 +511,7 @@ def main() -> None:
         per_obs = observer_rows.sum(dim=1)
         covered = float((observer_rows.sum(dim=0) > 0.5).float().mean().item())
         print(
-            "Observer state split: even cover "
+            "Observer state split: spatial patches "
             f"(dims/observer min={int(per_obs.min().item())}, max={int(per_obs.max().item())}, "
             f"global_coverage={covered:.3f})"
         )
@@ -487,6 +613,7 @@ def main() -> None:
                 mp4_path=mp4_path,
                 mp4_fps=args.pixel_video_fps,
                 video_env_index=args.pixel_video_env_index,
+                display_auto_rescale=args.display_auto_rescale,
             )
             print(
                 f"Direct pixel eval epoch {epoch}: "

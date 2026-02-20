@@ -303,12 +303,12 @@ This variant keeps the same training setup but changes evaluation to use observe
 - Observer agents optimize:
   - next local observation prediction (`self` loss),
   - next-neighbor latent prediction (`neighbor` loss).
-- Observer input coverage: by default, observer agents split the full observation vector evenly so their union covers the whole environment observation.
+- Observer input coverage: the full image observation is partitioned into disjoint spatial patches, with one patch per observer (e.g. 16 observers -> 16 patches), covering the whole image.
 - Non-observer agents optimize:
   - next-neighbor latent prediction only.
 - Pixel evaluation:
-  - at each horizon step, aggregate all observer `self` predictions (full vector) into a single global prediction,
-  - compare directly against the true next observation pixels.
+  - at each horizon step, stitch observer patch predictions back into one global predicted frame,
+  - compare against the standard full ground-truth observation frame.
 
 Run:
 
