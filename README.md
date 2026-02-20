@@ -295,3 +295,32 @@ python gym_distributed_local_world_model_experiment.py \
   --graph-cols 4 \
   --observer-placement cluster2d
 ```
+
+## Observer-direct pixel eval variant
+
+This variant keeps the same training setup but changes evaluation to use observer predictions directly (no global pixel probe fit):
+
+- Observer agents optimize:
+  - next local observation prediction (`self` loss),
+  - next-neighbor latent prediction (`neighbor` loss).
+- Non-observer agents optimize:
+  - next-neighbor latent prediction only.
+- Pixel evaluation:
+  - at each horizon step, aggregate observer `self` predictions into a single global prediction,
+  - compare directly against the true next observation pixels.
+
+Run:
+
+```bash
+python gym_distributed_observer_direct_pixel_eval.py \
+  --env MiniGrid-Dynamic-Obstacles-16x16-v0 \
+  --agents 32 \
+  --graph sphere \
+  --graph-rows 8 \
+  --graph-cols 4 \
+  --observer-placement cluster2d \
+  --pixel-horizon 8 \
+  --pixel-eval-every 1 \
+  --save-pixel-mp4 \
+  --wandb --wandb-project emergent-world-models
+```

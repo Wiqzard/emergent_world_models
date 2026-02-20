@@ -1175,7 +1175,8 @@ def save_side_by_side_mp4(
         fps=max(1, int(fps)),
         codec="libx264",
         pix_fmt_in="rgb24",
-        pix_fmt_out="yuv420p",
+        # yuv420p requires even width/height. yuv444p avoids failures for odd-sized env renders.
+        pix_fmt_out="yuv444p",
         macro_block_size=1,
     )
     writer.send(None)
