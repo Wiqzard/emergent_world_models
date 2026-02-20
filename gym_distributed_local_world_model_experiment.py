@@ -1171,6 +1171,142 @@ def save_side_by_side_mp4(
             writer.append_data(side)
 
 
+def append_tag_to_path(path: str, tag: str) -> str:
+    out_dir, name = os.path.split(path)
+    stem, ext = os.path.splitext(name)
+    tagged_name = f"{stem}_{tag}{ext}" if ext else f"{stem}_{tag}"
+    return os.path.join(out_dir, tagged_name)
+
+
+@torch.no_grad()
+def run_pixel_probe_snapshot(
+    model: DistributedGymWorldModel,
+    pixel_probe_train_rollout: GymBatchRollout,
+    pixel_probe_test_rollout: GymBatchRollout,
+    train_batches: int,
+    test_batches: int,
+    seq_len: int,
+    device: torch.device,
+    base_observer_mask: torch.Tensor,
+    base_state_mask: torch.Tensor,
+    graph: Graph,
+    disable_messages: bool,
+    permute_agent_positions: bool,
+    pixel_height: int,
+    pixel_width: int,
+    pixel_horizon: int,
+    pixel_probe_l2: float,
+    pixel_vis_frames: int,
+    pixel_plot_file: str,
+    save_pixel_mp4: bool,
+    pixel_mp4_prefix: str,
+    pixel_video_fps: int,
+    pixel_video_env_index: int,
+) -> Dict[str, object]:
+    pixel_train_sets = collect_pixel_probe_dataset_multi_h(
+        model=model,
+        rollout=pixel_probe_train_rollout,
+        num_batches=train_batches,
+        seq_len=seq_len,
+        device=device,
+        base_observer_mask=base_observer_mask,
+        base_state_mask=base_state_mask,
+        graph=graph,
+        disable_messages=disable_messages,
+        permute_agent_positions=permute_agent_positions,
+        pixel_height=pixel_height,
+        pixel_width=pixel_width,
+        max_horizon=pixel_horizon,
+    )
+    pixel_test_sets = collect_pixel_probe_dataset_multi_h(
+        model=model,
+        rollout=pixel_probe_test_rollout,
+        num_batches=test_batches,
+        seq_len=seq_len,
+        device=device,
+        base_observer_mask=base_observer_mask,
+        base_state_mask=base_state_mask,
+        graph=graph,
+        disable_messages=disable_messages,
+        permute_agent_positions=permute_agent_positions,
+        pixel_height=pixel_height,
+        pixel_width=pixel_width,
+        max_horizon=pixel_horizon,
+    )
+
+    metrics: Dict[str, float] = {}
+    horizon_to_true_pred: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+    pixel_probe_weights: Dict[int, torch.Tensor] = {}
+    for h in range(1, pixel_horizon + 1):
+        x_pix_train, y_pix_train = pixel_train_sets[h]
+        x_pix_test, y_pix_test = pixel_test_sets[h]
+        w_pix_h = fit_ridge_regression(x_pix_train, y_pix_train, l2=pixel_probe_l2)
+        pixel_probe_weights[h] = w_pix_h
+        y_pix_train_pred = ridge_predict(x_pix_train, w_pix_h)
+        y_pix_test_pred = ridge_predict(x_pix_test, w_pix_h)
+        pixel_train_mse = mse_value(y_pix_train_pred, y_pix_train)
+        pixel_test_mse = mse_value(y_pix_test_pred, y_pix_test)
+        pixel_baseline = y_pix_train.mean(dim=0, keepdim=True)
+        pixel_baseline_mse = mse_value(pixel_baseline.expand_as(y_pix_test), y_pix_test)
+        pixel_sse = torch.sum((y_pix_test_pred - y_pix_test) ** 2)
+        pixel_sst = torch.sum((y_pix_test - y_pix_test.mean(dim=0, keepdim=True)) ** 2).clamp(min=1e-8)
+        pixel_r2 = float((1.0 - pixel_sse / pixel_sst).item())
+
+        metrics[f"h{h}/train_mse"] = pixel_train_mse
+        metrics[f"h{h}/test_mse"] = pixel_test_mse
+        metrics[f"h{h}/test_baseline_mse"] = pixel_baseline_mse
+        metrics[f"h{h}/test_r2"] = pixel_r2
+        horizon_to_true_pred[h] = (y_pix_test, y_pix_test_pred)
+
+    plot_path = None
+    if plt is not None:
+        create_pixel_prediction_plot(
+            horizon_to_true_pred=horizon_to_true_pred,
+            pixel_height=pixel_height,
+            pixel_width=pixel_width,
+            output_path=pixel_plot_file,
+            max_frames=pixel_vis_frames,
+        )
+        plot_path = pixel_plot_file
+
+    mp4_paths: Dict[int, str] = {}
+    if save_pixel_mp4:
+        horizon_videos = collect_pixel_video_sequences(
+            model=model,
+            rollout=pixel_probe_test_rollout,
+            seq_len=seq_len,
+            device=device,
+            base_observer_mask=base_observer_mask,
+            base_state_mask=base_state_mask,
+            graph=graph,
+            disable_messages=disable_messages,
+            permute_agent_positions=permute_agent_positions,
+            pixel_height=pixel_height,
+            pixel_width=pixel_width,
+            max_horizon=pixel_horizon,
+            video_env_index=pixel_video_env_index,
+            pixel_probe_weights=pixel_probe_weights,
+        )
+        for h in range(1, pixel_horizon + 1):
+            out_path = f"{pixel_mp4_prefix}_h{h}.mp4"
+            true_h, pred_h = horizon_videos[h]
+            save_side_by_side_mp4(
+                true_frames_vec=true_h,
+                pred_frames_vec=pred_h,
+                pixel_height=pixel_height,
+                pixel_width=pixel_width,
+                output_path=out_path,
+                fps=pixel_video_fps,
+            )
+            mp4_paths[h] = out_path
+
+    return {
+        "metrics": metrics,
+        "plot_path": plot_path,
+        "mp4_paths": mp4_paths,
+    }
+
+
 def create_metrics_plot(
     history: Dict[str, List[float]],
     final_metrics: Dict[str, float],
@@ -1266,6 +1402,9 @@ def main() -> None:
     parser.add_argument("--pixel-mp4-prefix", type=str, default="outputs/gym_pixel_prediction")
     parser.add_argument("--pixel-video-fps", type=int, default=6)
     parser.add_argument("--pixel-video-env-index", type=int, default=0)
+    parser.add_argument("--pixel-eval-every", type=int, default=1, help="Run pixel visualization every N eval epochs.")
+    parser.add_argument("--pixel-eval-train-batches", type=int, default=1)
+    parser.add_argument("--pixel-eval-test-batches", type=int, default=1)
     parser.add_argument("--skip-agent-probes", action="store_true")
     parser.add_argument("--plot-file", type=str, default="outputs/gym_world_model_metrics.png")
     parser.add_argument("--wandb", action="store_true")
@@ -1284,6 +1423,15 @@ def main() -> None:
         raise ValueError("--frame-skip must be >= 1")
     if args.pixel_horizon < 1:
         raise ValueError("--pixel-horizon must be >= 1")
+    if args.pixel_eval_every < 1:
+        raise ValueError("--pixel-eval-every must be >= 1")
+    if args.pixel_eval_train_batches < 1 or args.pixel_eval_test_batches < 1:
+        raise ValueError("--pixel-eval-train-batches and --pixel-eval-test-batches must be >= 1")
+    if args.save_pixel_mp4 and imageio is None:
+        raise RuntimeError(
+            "--save-pixel-mp4 requested but imageio is not installed. "
+            "Update env from environment.yml."
+        )
 
     set_seed(args.seed)
     device = resolve_device(args.device)
@@ -1379,6 +1527,7 @@ def main() -> None:
     if args.pixel_probe:
         print(f"Pixel probe horizon (macro-steps ahead): {args.pixel_horizon}")
         print(f"Save pixel MP4s: {args.save_pixel_mp4}")
+        print(f"Pixel visualization eval cadence: every {args.pixel_eval_every} epoch(s)")
     print(
         "Loss weights: "
         f"self={args.lambda_self}, "
@@ -1476,6 +1625,71 @@ def main() -> None:
                     "eval/blind_reg_loss": metrics["blind_reg_loss"],
                 }
             )
+
+        if args.pixel_probe and pixel_probe_train_rollout is not None and pixel_probe_test_rollout is not None:
+            if epoch % args.pixel_eval_every == 0:
+                tag = f"epoch{epoch:04d}"
+                eval_plot_path = append_tag_to_path(args.pixel_plot_file, tag)
+                eval_mp4_prefix = f"{args.pixel_mp4_prefix}_{tag}"
+                eval_pixel = run_pixel_probe_snapshot(
+                    model=model,
+                    pixel_probe_train_rollout=pixel_probe_train_rollout,
+                    pixel_probe_test_rollout=pixel_probe_test_rollout,
+                    train_batches=args.pixel_eval_train_batches,
+                    test_batches=args.pixel_eval_test_batches,
+                    seq_len=args.seq_len,
+                    device=device,
+                    base_observer_mask=base_observer_mask,
+                    base_state_mask=base_state_mask,
+                    graph=graph,
+                    disable_messages=args.disable_messages,
+                    permute_agent_positions=args.permute_agent_positions,
+                    pixel_height=args.pixel_height,
+                    pixel_width=args.pixel_width,
+                    pixel_horizon=args.pixel_horizon,
+                    pixel_probe_l2=args.pixel_probe_l2,
+                    pixel_vis_frames=args.pixel_vis_frames,
+                    pixel_plot_file=eval_plot_path,
+                    save_pixel_mp4=args.save_pixel_mp4,
+                    pixel_mp4_prefix=eval_mp4_prefix,
+                    pixel_video_fps=args.pixel_video_fps,
+                    pixel_video_env_index=args.pixel_video_env_index,
+                )
+                metrics_h = eval_pixel["metrics"]
+                print(
+                    f"Eval pixel snapshot epoch {epoch}: "
+                    f"h={args.pixel_horizon} test_mse={metrics_h[f'h{args.pixel_horizon}/test_mse']:.6f} "
+                    f"r2={metrics_h[f'h{args.pixel_horizon}/test_r2']:.6f}"
+                )
+                if eval_pixel["plot_path"] is not None:
+                    print(f"Saved eval pixel plot: {eval_pixel['plot_path']}")
+                if args.save_pixel_mp4:
+                    for h in range(1, args.pixel_horizon + 1):
+                        path_h = eval_pixel["mp4_paths"].get(h)
+                        if path_h is not None:
+                            print(f"Saved eval pixel MP4 (h={h}): {path_h}")
+
+                if wandb_run is not None:
+                    payload = {}
+                    for h in range(1, args.pixel_horizon + 1):
+                        payload[f"eval_pixel/h{h}/train_mse"] = metrics_h[f"h{h}/train_mse"]
+                        payload[f"eval_pixel/h{h}/test_mse"] = metrics_h[f"h{h}/test_mse"]
+                        payload[f"eval_pixel/h{h}/test_baseline_mse"] = metrics_h[f"h{h}/test_baseline_mse"]
+                        payload[f"eval_pixel/h{h}/test_r2"] = metrics_h[f"h{h}/test_r2"]
+                    if eval_pixel["plot_path"] is not None:
+                        payload["eval_pixel/plot"] = wandb.Image(eval_pixel["plot_path"])
+                    if args.save_pixel_mp4:
+                        for h in range(1, args.pixel_horizon + 1):
+                            path_h = eval_pixel["mp4_paths"].get(h)
+                            if path_h is not None:
+                                payload[f"eval_pixel/video_h{h}"] = wandb.Video(
+                                    path_h,
+                                    fps=max(1, int(args.pixel_video_fps)),
+                                    format="mp4",
+                                )
+                    if payload:
+                        payload["epoch"] = epoch
+                        wandb.log(payload)
 
     print("Collecting latent datasets for global probe...")
     x_global_train, x_agent_train, y_train = collect_probe_dataset(
