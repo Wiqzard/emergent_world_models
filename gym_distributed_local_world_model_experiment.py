@@ -4,6 +4,9 @@ import random
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -205,11 +208,26 @@ def sample_identity_assignments(
 
 
 class GymBatchRollout:
-    def __init__(self, env_name: str, batch_size: int, seed: int):
+    def __init__(
+        self,
+        env_name: str,
+        batch_size: int,
+        seed: int,
+        render_mode: Optional[str] = None,
+    ):
         self.env_name = env_name
         self.batch_size = batch_size
         self.base_seed = seed
-        self.envs = [gym.make(env_name) for _ in range(batch_size)]
+        self.render_mode = render_mode
+        if render_mode is None:
+            self.envs = [gym.make(env_name) for _ in range(batch_size)]
+        else:
+            try:
+                self.envs = [gym.make(env_name, render_mode=render_mode) for _ in range(batch_size)]
+            except TypeError as exc:
+                raise RuntimeError(
+                    f"Environment {env_name} does not accept render_mode={render_mode}."
+                ) from exc
         self.step_count = 0
 
         obs0 = env_reset(self.envs[0], seed=seed)
@@ -222,13 +240,19 @@ class GymBatchRollout:
             self.current_obs.append(env_reset(env, seed=seed + i))
         self.current_obs = np.stack(self.current_obs, axis=0).astype(np.float32)
 
-    def sample_rollout(self, seq_len_plus_one: int) -> Tuple[np.ndarray, np.ndarray]:
+    def sample_rollout(
+        self,
+        seq_len_plus_one: int,
+        include_frames: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         states = [self.current_obs.copy()]
         actions = []
+        frames = [] if include_frames else None
 
         for _ in range(seq_len_plus_one - 1):
             action_vecs = np.zeros((self.batch_size, self.action_dim), dtype=np.float32)
             next_obs = np.zeros((self.batch_size, self.obs_dim), dtype=np.float32)
+            next_frames = [] if include_frames else None
 
             for i, env in enumerate(self.envs):
                 action = env.action_space.sample()
@@ -238,13 +262,32 @@ class GymBatchRollout:
                     reset_seed = self.base_seed + 100000 + self.step_count * self.batch_size + i
                     obs_next = env_reset(env, seed=reset_seed)
                 next_obs[i] = obs_next
+                if include_frames:
+                    try:
+                        frame = env.render()
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Pixel probe rendering failed. Install rendering dependencies "
+                            "(for classic-control: `pygame`) or use an env with rgb_array support."
+                        ) from exc
+                    if frame is None:
+                        raise RuntimeError(
+                            "Pixel probe requested but env.render() returned None. "
+                            "Use an environment that supports rgb_array rendering."
+                        )
+                    next_frames.append(frame)
 
             self.step_count += 1
             self.current_obs = next_obs
             actions.append(action_vecs)
             states.append(next_obs.copy())
+            if include_frames and frames is not None and next_frames is not None:
+                frames.append(np.stack(next_frames, axis=0))
 
-        return np.stack(states, axis=1), np.stack(actions, axis=1)
+        frames_out = None
+        if include_frames and frames is not None:
+            frames_out = np.stack(frames, axis=1)
+        return np.stack(states, axis=1), np.stack(actions, axis=1), frames_out
 
     def close(self) -> None:
         for env in self.envs:
@@ -491,7 +534,7 @@ def evaluate_model(
     blind_total = 0.0
 
     for _ in range(eval_batches):
-        states_np, actions_np = rollout.sample_rollout(seq_len_plus_one=seq_len + 1)
+        states_np, actions_np, _ = rollout.sample_rollout(seq_len_plus_one=seq_len + 1)
         states = torch.as_tensor(states_np, dtype=torch.float32, device=device)
         actions = torch.as_tensor(actions_np, dtype=torch.float32, device=device)
         loss, self_loss, neighbor_loss, blind_loss = compute_sequence_loss(
@@ -544,7 +587,7 @@ def collect_probe_dataset(
     obs_dim = base_state_mask.shape[1]
 
     for _ in range(num_batches):
-        states_np, actions_np = rollout.sample_rollout(seq_len_plus_one=seq_len + 1)
+        states_np, actions_np, _ = rollout.sample_rollout(seq_len_plus_one=seq_len + 1)
         states = torch.as_tensor(states_np, dtype=torch.float32, device=device)
         actions = torch.as_tensor(actions_np, dtype=torch.float32, device=device)
         b = states.shape[0]
@@ -585,6 +628,89 @@ def collect_probe_dataset(
     y = torch.cat(targets, dim=0)
     x_agent = torch.cat(agent_x, dim=0) if include_agent_latents else None
     return x_global, x_agent, y
+
+
+def preprocess_frames_to_vectors(
+    frames_np: np.ndarray,
+    pixel_height: int,
+    pixel_width: int,
+    device: torch.device,
+) -> torch.Tensor:
+    # frames_np: [B, T, H0, W0, C]
+    frames = torch.as_tensor(frames_np, dtype=torch.float32, device=device)
+    if frames.max() > 1.0:
+        frames = frames / 255.0
+    if frames.shape[-1] == 1:
+        frames = frames.repeat_interleave(3, dim=-1)
+    b, t, h0, w0, c = frames.shape
+    frames_chw = frames.permute(0, 1, 4, 2, 3).reshape(b * t, c, h0, w0)
+    resized = F.interpolate(frames_chw, size=(pixel_height, pixel_width), mode="bilinear", align_corners=False)
+    return resized.reshape(b, t, -1)
+
+
+@torch.no_grad()
+def collect_pixel_probe_dataset(
+    model: DistributedGymWorldModel,
+    rollout: GymBatchRollout,
+    num_batches: int,
+    seq_len: int,
+    device: torch.device,
+    base_observer_mask: torch.Tensor,
+    base_state_mask: torch.Tensor,
+    graph: Graph,
+    disable_messages: bool,
+    permute_agent_positions: bool,
+    pixel_height: int,
+    pixel_width: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    model.eval()
+    global_x = []
+    pixel_targets = []
+
+    num_agents = base_observer_mask.shape[0]
+    obs_dim = base_state_mask.shape[1]
+
+    for _ in range(num_batches):
+        states_np, actions_np, frames_np = rollout.sample_rollout(seq_len_plus_one=seq_len + 1, include_frames=True)
+        if frames_np is None:
+            raise RuntimeError("Pixel probe requested but no frames were captured from rollout.")
+
+        states = torch.as_tensor(states_np, dtype=torch.float32, device=device)
+        actions = torch.as_tensor(actions_np, dtype=torch.float32, device=device)
+        pixel_vecs = preprocess_frames_to_vectors(frames_np, pixel_height=pixel_height, pixel_width=pixel_width, device=device)
+        b = states.shape[0]
+
+        identity_at_pos = sample_identity_assignments(
+            batch_size=b,
+            num_agents=num_agents,
+            permute_agent_positions=permute_agent_positions,
+            device=device,
+        )
+        obs_mask = base_observer_mask[identity_at_pos]
+        state_mask = base_state_mask[identity_at_pos]
+        id_features = model.identity_features(identity_at_pos)
+        z = model.initial_latent(id_features)
+
+        for t in range(seq_len):
+            state_t = states[:, t]
+            action_t = actions[:, t]
+            state_local = state_t.unsqueeze(1).expand(b, num_agents, obs_dim) * state_mask
+            action_local = action_t.unsqueeze(1).expand(b, num_agents, action_t.shape[-1]) * obs_mask.unsqueeze(-1)
+            z, _, _ = model.step(
+                z_prev=z,
+                obs_local=state_local,
+                action_local=action_local,
+                obs_mask=obs_mask,
+                id_features=id_features,
+                neighbor_idx=graph.neighbor_idx,
+                neighbor_mask=graph.neighbor_mask,
+                edge_feat=graph.edge_feat,
+                disable_messages=disable_messages,
+            )
+            global_x.append(z.reshape(b, -1).cpu())
+            pixel_targets.append(pixel_vecs[:, t].cpu())
+
+    return torch.cat(global_x, dim=0), torch.cat(pixel_targets, dim=0)
 
 
 def fit_ridge_regression(x: torch.Tensor, y: torch.Tensor, l2: float) -> torch.Tensor:
@@ -637,6 +763,45 @@ def evaluate_agent_probes(
     }
 
 
+def create_pixel_prediction_plot(
+    y_true: torch.Tensor,
+    y_pred: torch.Tensor,
+    pixel_height: int,
+    pixel_width: int,
+    output_path: str,
+    max_frames: int = 6,
+) -> None:
+    if plt is None:
+        raise RuntimeError("matplotlib is not installed; cannot create pixel prediction plot.")
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    n = min(max_frames, y_true.shape[0])
+    true_img = y_true[:n].reshape(n, 3, pixel_height, pixel_width).permute(0, 2, 3, 1).numpy()
+    pred_img = y_pred[:n].reshape(n, 3, pixel_height, pixel_width).permute(0, 2, 3, 1).numpy()
+    true_img = np.clip(true_img, 0.0, 1.0)
+    pred_img = np.clip(pred_img, 0.0, 1.0)
+
+    fig, axes = plt.subplots(2, n, figsize=(2.2 * n, 4.2))
+    if n == 1:
+        axes = np.array([[axes[0]], [axes[1]]])
+
+    for col in range(n):
+        axes[0, col].imshow(true_img[col])
+        axes[0, col].set_title(f"True t+1 #{col+1}", fontsize=9)
+        axes[0, col].axis("off")
+        axes[1, col].imshow(pred_img[col])
+        axes[1, col].set_title(f"Pred t+1 #{col+1}", fontsize=9)
+        axes[1, col].axis("off")
+
+    fig.suptitle("Global Pixel Prediction From Distributed Latent", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
 def create_metrics_plot(
     history: Dict[str, List[float]],
     final_metrics: Dict[str, float],
@@ -645,7 +810,9 @@ def create_metrics_plot(
     if plt is None:
         raise RuntimeError("matplotlib is not installed; cannot create metrics plot.")
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
     epochs = np.array(history["epoch"])
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
@@ -706,6 +873,15 @@ def main() -> None:
     parser.add_argument("--probe-train-batches", type=int, default=24)
     parser.add_argument("--probe-test-batches", type=int, default=12)
     parser.add_argument("--probe-l2", type=float, default=1e-2)
+    parser.add_argument("--pixel-probe", action="store_true")
+    parser.add_argument("--pixel-probe-train-batches", type=int, default=12)
+    parser.add_argument("--pixel-probe-test-batches", type=int, default=6)
+    parser.add_argument("--pixel-probe-batch-size", type=int, default=4)
+    parser.add_argument("--pixel-height", type=int, default=84)
+    parser.add_argument("--pixel-width", type=int, default=84)
+    parser.add_argument("--pixel-probe-l2", type=float, default=1e-2)
+    parser.add_argument("--pixel-vis-frames", type=int, default=6)
+    parser.add_argument("--pixel-plot-file", type=str, default="outputs/gym_pixel_prediction_comparison.png")
     parser.add_argument("--skip-agent-probes", action="store_true")
     parser.add_argument("--plot-file", type=str, default="outputs/gym_world_model_metrics.png")
     parser.add_argument("--wandb", action="store_true")
@@ -728,6 +904,21 @@ def main() -> None:
     eval_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 17)
     probe_train_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 23)
     probe_test_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 29)
+    pixel_probe_train_rollout = None
+    pixel_probe_test_rollout = None
+    if args.pixel_probe:
+        pixel_probe_train_rollout = GymBatchRollout(
+            args.env,
+            args.pixel_probe_batch_size,
+            seed=args.seed + 31,
+            render_mode="rgb_array",
+        )
+        pixel_probe_test_rollout = GymBatchRollout(
+            args.env,
+            args.pixel_probe_batch_size,
+            seed=args.seed + 37,
+            render_mode="rgb_array",
+        )
 
     obs_dim = train_rollout.obs_dim
     action_dim = train_rollout.action_dim
@@ -777,6 +968,7 @@ def main() -> None:
     print(f"Observers: {num_observers} | Blind: {num_blind}")
     print(f"Permute identity-position: {args.permute_agent_positions}")
     print(f"Disable messages: {args.disable_messages}")
+    print(f"Pixel probe enabled: {args.pixel_probe}")
     print(
         "Loss weights: "
         f"self={args.lambda_self}, "
@@ -800,7 +992,7 @@ def main() -> None:
         train_blind = 0.0
 
         for _ in range(args.steps_per_epoch):
-            states_np, actions_np = train_rollout.sample_rollout(seq_len_plus_one=args.seq_len + 1)
+            states_np, actions_np, _ = train_rollout.sample_rollout(seq_len_plus_one=args.seq_len + 1)
             states = torch.as_tensor(states_np, dtype=torch.float32, device=device)
             actions = torch.as_tensor(actions_np, dtype=torch.float32, device=device)
 
@@ -945,6 +1137,77 @@ def main() -> None:
         print(f"- observer_agent_probe_mse: {final_metrics['observer_agent_probe_mse']:.6f}")
         print(f"- blind_agent_probe_mse: {final_metrics['blind_agent_probe_mse']:.6f}")
 
+    pixel_plot_saved = False
+    if args.pixel_probe:
+        if pixel_probe_train_rollout is None or pixel_probe_test_rollout is None:
+            raise RuntimeError("Pixel probe enabled but pixel rollouts were not initialized.")
+
+        print("Collecting pixel datasets for global latent->pixel probe...")
+        x_pix_train, y_pix_train = collect_pixel_probe_dataset(
+            model=model,
+            rollout=pixel_probe_train_rollout,
+            num_batches=args.pixel_probe_train_batches,
+            seq_len=args.seq_len,
+            device=device,
+            base_observer_mask=base_observer_mask,
+            base_state_mask=base_state_mask,
+            graph=graph,
+            disable_messages=args.disable_messages,
+            permute_agent_positions=args.permute_agent_positions,
+            pixel_height=args.pixel_height,
+            pixel_width=args.pixel_width,
+        )
+        x_pix_test, y_pix_test = collect_pixel_probe_dataset(
+            model=model,
+            rollout=pixel_probe_test_rollout,
+            num_batches=args.pixel_probe_test_batches,
+            seq_len=args.seq_len,
+            device=device,
+            base_observer_mask=base_observer_mask,
+            base_state_mask=base_state_mask,
+            graph=graph,
+            disable_messages=args.disable_messages,
+            permute_agent_positions=args.permute_agent_positions,
+            pixel_height=args.pixel_height,
+            pixel_width=args.pixel_width,
+        )
+
+        w_pix = fit_ridge_regression(x_pix_train, y_pix_train, l2=args.pixel_probe_l2)
+        y_pix_train_pred = ridge_predict(x_pix_train, w_pix)
+        y_pix_test_pred = ridge_predict(x_pix_test, w_pix)
+        pixel_train_mse = mse_value(y_pix_train_pred, y_pix_train)
+        pixel_test_mse = mse_value(y_pix_test_pred, y_pix_test)
+        pixel_baseline = y_pix_train.mean(dim=0, keepdim=True)
+        pixel_baseline_mse = mse_value(pixel_baseline.expand_as(y_pix_test), y_pix_test)
+        pixel_sse = torch.sum((y_pix_test_pred - y_pix_test) ** 2)
+        pixel_sst = torch.sum((y_pix_test - y_pix_test.mean(dim=0, keepdim=True)) ** 2).clamp(min=1e-8)
+        pixel_r2 = float((1.0 - pixel_sse / pixel_sst).item())
+
+        final_metrics["pixel_train_mse"] = pixel_train_mse
+        final_metrics["pixel_test_mse"] = pixel_test_mse
+        final_metrics["pixel_baseline_test_mse"] = pixel_baseline_mse
+        final_metrics["pixel_test_r2"] = pixel_r2
+
+        print("Pixel probe results (global latent -> next RGB frame):")
+        print(f"- pixel_train_mse: {pixel_train_mse:.6f}")
+        print(f"- pixel_test_mse: {pixel_test_mse:.6f}")
+        print(f"- pixel_test_mse_baseline(mean): {pixel_baseline_mse:.6f}")
+        print(f"- pixel_test_r2: {pixel_r2:.6f}")
+
+        if plt is None:
+            print("matplotlib is not installed; skipping pixel comparison image export.")
+        else:
+            create_pixel_prediction_plot(
+                y_true=y_pix_test,
+                y_pred=y_pix_test_pred,
+                pixel_height=args.pixel_height,
+                pixel_width=args.pixel_width,
+                output_path=args.pixel_plot_file,
+                max_frames=args.pixel_vis_frames,
+            )
+            pixel_plot_saved = True
+            print(f"Saved pixel comparison: {args.pixel_plot_file}")
+
     plot_saved = False
     if plt is None:
         print("matplotlib is not installed; skipping plot export.")
@@ -965,6 +1228,13 @@ def main() -> None:
         if "observer_agent_probe_mse" in final_metrics:
             log_payload["probe/observer_agent_probe_mse"] = final_metrics["observer_agent_probe_mse"]
             log_payload["probe/blind_agent_probe_mse"] = final_metrics["blind_agent_probe_mse"]
+        if "pixel_train_mse" in final_metrics:
+            log_payload["pixel_probe/train_mse"] = final_metrics["pixel_train_mse"]
+            log_payload["pixel_probe/test_mse"] = final_metrics["pixel_test_mse"]
+            log_payload["pixel_probe/test_baseline_mse"] = final_metrics["pixel_baseline_test_mse"]
+            log_payload["pixel_probe/test_r2"] = final_metrics["pixel_test_r2"]
+        if pixel_plot_saved:
+            log_payload["plot/pixel_prediction"] = wandb.Image(args.pixel_plot_file)
         wandb.log(log_payload)
         wandb_run.finish()
 
@@ -972,6 +1242,10 @@ def main() -> None:
     eval_rollout.close()
     probe_train_rollout.close()
     probe_test_rollout.close()
+    if pixel_probe_train_rollout is not None:
+        pixel_probe_train_rollout.close()
+    if pixel_probe_test_rollout is not None:
+        pixel_probe_test_rollout.close()
     print("Done.")
 
 

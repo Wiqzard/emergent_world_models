@@ -9,3 +9,4 @@ dependencies:
   - pytorch
   - matplotlib
   - wandb
+  - pygame

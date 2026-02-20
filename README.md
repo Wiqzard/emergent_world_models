@@ -211,6 +211,16 @@ Visualization:
   - train/eval loss curves,
   - global probe test MSE vs baseline,
   - observer-vs-blind single-agent probe MSE (if enabled).
+- Optional pixel-level visualization (`--pixel-probe`) fits an additional latent->RGB-frame probe and saves:
+  - `outputs/gym_pixel_prediction_comparison.png` (or `--pixel-plot-file`),
+  - row 1 = true next frames, row 2 = predicted next frames.
+- For classic-control pixel rendering (`CartPole-v1`, `Acrobot-v1`), `pygame` is required (now included in `environment.yml`).
+
+Pixel comparison run example:
+
+```bash
+python gym_distributed_local_world_model_experiment.py --env CartPole-v1 --pixel-probe
+```
 
 Useful flags:
 
@@ -234,5 +244,12 @@ Useful flags:
 --probe-train-batches 24
 --probe-test-batches 12
 --plot-file outputs/gym_world_model_metrics.png
+--pixel-probe
+--pixel-probe-train-batches 12
+--pixel-probe-test-batches 6
+--pixel-probe-batch-size 4
+--pixel-height 84
+--pixel-width 84
+--pixel-plot-file outputs/gym_pixel_prediction_comparison.png
 --wandb
 ```
