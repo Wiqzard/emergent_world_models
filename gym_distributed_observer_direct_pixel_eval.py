@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 try:
     import matplotlib.pyplot as plt
@@ -184,6 +185,40 @@ def ensure_rgb_vectors(vec: torch.Tensor, h: int, w: int, c: int) -> torch.Tenso
     return frames.permute(0, 3, 1, 2).reshape(frames.shape[0], -1)
 
 
+def vec_to_rgb_hwc(vec: torch.Tensor, h: int, w: int, c: int) -> torch.Tensor:
+    rgb_vec = ensure_rgb_vectors(vec, h=h, w=w, c=c)
+    return rgb_vec.reshape(rgb_vec.shape[0], 3, h, w).permute(0, 2, 3, 1)
+
+
+def ensure_rgb_frames_hwc(frames: torch.Tensor) -> torch.Tensor:
+    x = frames.float()
+    if x.numel() == 0:
+        return x
+    if x.max() > 1.0:
+        x = x / 255.0
+    c = int(x.shape[-1])
+    if c == 3:
+        return x
+    if c == 1:
+        return x.repeat(1, 1, 1, 3)
+    if c > 3:
+        return x[..., :3]
+    reps = int(np.ceil(3.0 / c))
+    return x.repeat(1, 1, 1, reps)[..., :3]
+
+
+def resize_rgb_hwc(frames: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
+    if int(frames.shape[1]) == out_h and int(frames.shape[2]) == out_w:
+        return frames
+    chw = frames.permute(0, 3, 1, 2)
+    out = F.interpolate(chw, size=(out_h, out_w), mode="nearest")
+    return out.permute(0, 2, 3, 1)
+
+
+def frames_hwc_to_chw_vectors(frames: torch.Tensor) -> torch.Tensor:
+    return frames.permute(0, 3, 1, 2).reshape(frames.shape[0], -1)
+
+
 def rescale_for_display(true_vec: torch.Tensor, pred_vec: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     # MiniGrid observations are often small normalized symbolic values; auto-rescale for visibility.
     flat = torch.cat([true_vec.reshape(-1), pred_vec.reshape(-1)], dim=0)
@@ -208,8 +243,13 @@ def collect_direct_observer_pixel_sequences(
     disable_messages: bool,
     permute_agent_positions: bool,
     video_env_index: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    states_np, actions_np, _ = rollout.sample_rollout(seq_len_plus_one=pixel_horizon + 1, include_frames=False)
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    states_np, actions_np, frames_np = rollout.sample_rollout(seq_len_plus_one=pixel_horizon + 1, include_frames=True)
+    if frames_np is None:
+        raise RuntimeError(
+            "Direct pixel visualization needs render frames, but rollout returned none. "
+            "Use an environment with rgb_array rendering."
+        )
     states = torch.as_tensor(states_np, dtype=torch.float32, device=device)
     actions = torch.as_tensor(actions_np, dtype=torch.float32, device=device)
     b, _, obs_dim = states.shape
@@ -262,15 +302,15 @@ def collect_direct_observer_pixel_sequences(
         pred_seq.append(merged_pred[video_env_index].detach().cpu())
         true_seq.append(states[:, t + 1][video_env_index].detach().cpu())
 
-    return torch.stack(true_seq, dim=0), torch.stack(pred_seq, dim=0)
+    true_obs = torch.stack(true_seq, dim=0)
+    pred_obs = torch.stack(pred_seq, dim=0)
+    true_render = torch.as_tensor(frames_np[video_env_index], dtype=torch.float32)
+    return true_obs, pred_obs, true_render
 
 
 def save_direct_pixel_plot(
-    true_vec: torch.Tensor,
-    pred_vec: torch.Tensor,
-    h: int,
-    w: int,
-    c: int,
+    true_frames: torch.Tensor,
+    pred_frames: torch.Tensor,
     out_path: str,
 ) -> None:
     if plt is None:
@@ -279,17 +319,8 @@ def save_direct_pixel_plot(
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    true_img = true_vec.reshape(true_vec.shape[0], h, w, c).numpy()
-    pred_img = pred_vec.reshape(pred_vec.shape[0], h, w, c).numpy()
-    if c == 1:
-        true_img = np.repeat(true_img, 3, axis=-1)
-        pred_img = np.repeat(pred_img, 3, axis=-1)
-    elif c > 3:
-        true_img = true_img[..., :3]
-        pred_img = pred_img[..., :3]
-
-    true_img = np.clip(true_img, 0.0, 1.0)
-    pred_img = np.clip(pred_img, 0.0, 1.0)
+    true_img = np.clip(true_frames.numpy(), 0.0, 1.0)
+    pred_img = np.clip(pred_frames.numpy(), 0.0, 1.0)
     t = true_img.shape[0]
 
     fig, axes = plt.subplots(2, t, figsize=(2.2 * t, 4.4))
@@ -326,7 +357,7 @@ def run_direct_pixel_eval(
     video_env_index: int,
     display_auto_rescale: bool,
 ) -> Dict[str, float]:
-    true_vec, pred_vec = collect_direct_observer_pixel_sequences(
+    true_obs, pred_obs, true_render = collect_direct_observer_pixel_sequences(
         model=model,
         rollout=rollout,
         pixel_horizon=pixel_horizon,
@@ -338,28 +369,39 @@ def run_direct_pixel_eval(
         permute_agent_positions=permute_agent_positions,
         video_env_index=video_env_index,
     )
+    h_obs, w_obs, c_obs = img_shape
     if display_auto_rescale:
-        true_disp, pred_disp = rescale_for_display(true_vec, pred_vec)
+        _, pred_disp = rescale_for_display(true_obs, pred_obs)
     else:
-        true_disp, pred_disp = true_vec, pred_vec
-    mse = float(torch.mean((pred_vec - true_vec) ** 2).item())
-    baseline = true_vec.mean(dim=0, keepdim=True)
-    baseline_mse = float(torch.mean((baseline.expand_as(true_vec) - true_vec) ** 2).item())
-    sse = torch.sum((pred_vec - true_vec) ** 2)
-    sst = torch.sum((true_vec - true_vec.mean(dim=0, keepdim=True)) ** 2).clamp(min=1e-8)
+        pred_disp = pred_obs
+    mse = float(torch.mean((pred_obs - true_obs) ** 2).item())
+    baseline = true_obs.mean(dim=0, keepdim=True)
+    baseline_mse = float(torch.mean((baseline.expand_as(true_obs) - true_obs) ** 2).item())
+    sse = torch.sum((pred_obs - true_obs) ** 2)
+    sst = torch.sum((true_obs - true_obs.mean(dim=0, keepdim=True)) ** 2).clamp(min=1e-8)
     r2 = float((1.0 - sse / sst).item())
 
-    h, w, c = img_shape
-    save_direct_pixel_plot(true_vec=true_disp, pred_vec=pred_disp, h=h, w=w, c=c, out_path=plot_path)
+    true_frames_disp = ensure_rgb_frames_hwc(true_render)
+    pred_frames_disp = vec_to_rgb_hwc(pred_disp, h=h_obs, w=w_obs, c=c_obs)
+    pred_frames_disp = ensure_rgb_frames_hwc(pred_frames_disp)
+    pred_frames_disp = resize_rgb_hwc(
+        pred_frames_disp, out_h=int(true_frames_disp.shape[1]), out_w=int(true_frames_disp.shape[2])
+    )
+
+    save_direct_pixel_plot(
+        true_frames=true_frames_disp.cpu(),
+        pred_frames=pred_frames_disp.cpu(),
+        out_path=plot_path,
+    )
 
     if save_mp4:
-        true_rgb = ensure_rgb_vectors(true_disp, h=h, w=w, c=c)
-        pred_rgb = ensure_rgb_vectors(pred_disp, h=h, w=w, c=c)
+        true_rgb = frames_hwc_to_chw_vectors(true_frames_disp.cpu())
+        pred_rgb = frames_hwc_to_chw_vectors(pred_frames_disp.cpu())
         save_side_by_side_mp4(
             true_frames_vec=true_rgb,
             pred_frames_vec=pred_rgb,
-            pixel_height=h,
-            pixel_width=w,
+            pixel_height=int(true_frames_disp.shape[1]),
+            pixel_width=int(true_frames_disp.shape[2]),
             output_path=mp4_path,
             fps=mp4_fps,
         )
@@ -443,7 +485,13 @@ def main() -> None:
 
     train_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 11, frame_skip=args.frame_skip)
     eval_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 17, frame_skip=args.frame_skip)
-    pixel_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 23, frame_skip=args.frame_skip)
+    pixel_rollout = GymBatchRollout(
+        args.env,
+        args.batch_size,
+        seed=args.seed + 23,
+        frame_skip=args.frame_skip,
+        render_mode="rgb_array",
+    )
 
     img_shape = infer_obs_image_shape_from_env(train_rollout.envs[0])
     if img_shape is None:
