@@ -414,9 +414,17 @@ def main() -> None:
     parser.add_argument("--pixel-video-env-index", type=int, default=0)
     parser.add_argument(
         "--display-auto-rescale",
+        dest="display_auto_rescale",
         action="store_true",
-        help="Optional display-only contrast rescaling for PNG/MP4 (default: off).",
+        help="Display-only contrast rescaling for PNG/MP4 (default: on).",
     )
+    parser.add_argument(
+        "--no-display-auto-rescale",
+        dest="display_auto_rescale",
+        action="store_false",
+        help="Disable display-only contrast rescaling.",
+    )
+    parser.set_defaults(display_auto_rescale=True)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="emergent-world-models")
     parser.add_argument("--wandb-run-name", type=str, default=None)
