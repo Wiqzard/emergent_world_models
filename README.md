@@ -311,6 +311,10 @@ This variant keeps the same training setup but changes evaluation to use observe
   - at each horizon step, stitch observer patch predictions back into one global predicted frame,
   - compare against the standard full ground-truth render frame (`rgb_array`) for visualization.
   - display export uses auto-rescaling by default so low-range symbolic observations are visible (`--no-display-auto-rescale` to disable).
+- MiniGrid stability defaults in this variant:
+  - channel-wise symbolic normalization is applied before training/eval,
+  - default learning rate is `3e-4`,
+  - gradient clipping is enabled (`--grad-clip 1.0`).
 
 Run:
 

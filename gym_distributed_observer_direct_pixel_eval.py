@@ -16,19 +16,29 @@ try:
 except Exception:
     wandb = None
 
+try:
+    from minigrid.core.constants import COLORS, IDX_TO_COLOR
+except Exception:
+    COLORS = None
+    IDX_TO_COLOR = None
+
 from gym_distributed_local_world_model_experiment import (
     DistributedGymWorldModel,
     GymBatchRollout,
     append_tag_to_path,
     build_graph,
     compute_sequence_loss,
-    evaluate_model,
     sample_identity_assignments,
     sample_observer_mask,
     save_side_by_side_mp4,
     set_seed,
     resolve_device,
 )
+
+
+MINIGRID_SYMBOLIC_OBJECT_MAX = 10.0
+MINIGRID_SYMBOLIC_COLOR_MAX = 5.0
+MINIGRID_SYMBOLIC_STATE_MAX = 2.0
 
 
 def infer_obs_image_shape_from_env(env) -> Optional[Tuple[int, int, int]]:
@@ -42,6 +52,31 @@ def infer_obs_image_shape_from_env(env) -> Optional[Tuple[int, int, int]]:
     if shape is not None and len(shape) == 3:
         return tuple(int(v) for v in shape)
     return None
+
+
+def is_minigrid_symbolic_obs(env_name: str, img_shape: Tuple[int, int, int]) -> bool:
+    return env_name.startswith("MiniGrid-") and img_shape[2] == 3
+
+
+def preprocess_state_batch(
+    states: torch.Tensor,
+    env_name: str,
+    img_shape: Tuple[int, int, int],
+) -> torch.Tensor:
+    # For MiniGrid symbolic image observations, normalize each channel to [0,1] with channel-specific scale.
+    # flatten_observation() divides by 255, which makes targets extremely tiny and hurts optimization.
+    if not is_minigrid_symbolic_obs(env_name, img_shape):
+        return states
+    h, w, c = img_shape
+    x = states.reshape(*states.shape[:-1], h, w, c)
+    if float(x.max().item()) > 0.2:
+        # Already likely channel-normalized.
+        return states
+    ch0 = torch.clamp(x[..., 0] * (255.0 / MINIGRID_SYMBOLIC_OBJECT_MAX), 0.0, 1.0)
+    ch1 = torch.clamp(x[..., 1] * (255.0 / MINIGRID_SYMBOLIC_COLOR_MAX), 0.0, 1.0)
+    ch2 = torch.clamp(x[..., 2] * (255.0 / MINIGRID_SYMBOLIC_STATE_MAX), 0.0, 1.0)
+    x_norm = torch.stack([ch0, ch1, ch2], dim=-1)
+    return x_norm.reshape(*states.shape[:-1], h * w * c)
 
 def build_image_patch_state_masks_full_cover(
     num_agents: int,
@@ -115,61 +150,6 @@ def build_image_patch_state_masks_full_cover(
         raise RuntimeError(f"State mask has overlaps! Overlapping dims: {overlap}/{obs_dim}")
 
     return state_mask
-def build_image_patch_state_masks(
-    num_agents: int,
-    img_shape: Tuple[int, int, int],
-    observer_mask: torch.Tensor,
-    seed: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Assign each observer agent one contiguous (rectangular) patch of the image.
-    Patch covers all channels. Non-observers get all zeros.
-    """
-    h, w, c = img_shape
-    obs_dim = h * w * c
-    masks = np.zeros((num_agents, obs_dim), dtype=np.float32)
-
-    observer_idx = np.flatnonzero(observer_mask.detach().cpu().numpy() > 0.5)
-    n_obs = int(observer_idx.size)
-    if n_obs == 0:
-        return torch.as_tensor(masks, dtype=torch.float32, device=device)
-
-    # Permute observer assignment for reproducibility / fairness
-    rng = np.random.default_rng(seed + 101)
-    perm_obs = observer_idx[rng.permutation(n_obs)]
-
-    # Choose a near-square grid of patches
-    grid_rows = int(np.ceil(np.sqrt(n_obs)))
-    grid_cols = int(np.ceil(n_obs / grid_rows))
-
-    # Evenly split pixels into grid_rows x grid_cols rectangles
-    ys = np.linspace(0, h, grid_rows + 1, dtype=int)
-    xs = np.linspace(0, w, grid_cols + 1, dtype=int)
-
-    def flat_index(y, x, ch):
-        return (y * w + x) * c + ch
-
-    for k, agent in enumerate(perm_obs):
-        r = k // grid_cols
-        cc = k % grid_cols
-        if r >= grid_rows:
-            break  # should not happen, but safe
-
-        y0, y1 = int(ys[r]), int(ys[r + 1])
-        x0, x1 = int(xs[cc]), int(xs[cc + 1])
-
-        # Fill mask for this rectangle (all channels)
-        for y in range(y0, y1):
-            base = (y * w + x0) * c
-            # vectorize x loop a bit
-            for x in range(x0, x1):
-                idx0 = (y * w + x) * c
-                masks[int(agent), idx0:idx0 + c] = 1.0
-
-    return torch.as_tensor(masks, dtype=torch.float32, device=device)
-
-
 def ensure_rgb_vectors(vec: torch.Tensor, h: int, w: int, c: int) -> torch.Tensor:
     frames = vec.reshape(vec.shape[0], h, w, c)
     if c == 3:
@@ -183,6 +163,29 @@ def ensure_rgb_vectors(vec: torch.Tensor, h: int, w: int, c: int) -> torch.Tenso
         reps = int(np.ceil(3.0 / c))
         frames = frames.repeat(1, 1, 1, reps)[..., :3]
     return frames.permute(0, 3, 1, 2).reshape(frames.shape[0], -1)
+
+
+def decode_minigrid_symbolic_vec_to_rgb_hwc(vec: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    # vec is expected in channel-normalized space: [obj/10, color/5, state/2].
+    if COLORS is None or IDX_TO_COLOR is None:
+        return vec_to_rgb_hwc(vec, h=h, w=w, c=3)
+
+    x = vec.reshape(vec.shape[0], h, w, 3)
+    palette_np = np.stack([COLORS[IDX_TO_COLOR[i]] for i in range(6)], axis=0).astype(np.float32) / 255.0
+    palette = torch.as_tensor(palette_np, dtype=x.dtype, device=x.device)
+
+    # Soft color decoding keeps per-pixel differences visible during learning.
+    color_pos = torch.clamp(x[..., 1], 0.0, 1.0) * MINIGRID_SYMBOLIC_COLOR_MAX
+    low = torch.floor(color_pos).long().clamp(0, 5)
+    high = torch.clamp(low + 1, max=5)
+    t = (color_pos - low.float()).unsqueeze(-1)
+    rgb = palette[low] * (1.0 - t) + palette[high] * t
+
+    # Hide unseen/empty cells so occupancy structure remains readable.
+    obj_pos = torch.clamp(x[..., 0], 0.0, 1.0) * MINIGRID_SYMBOLIC_OBJECT_MAX
+    unseen_or_empty = obj_pos < 1.5
+    rgb[unseen_or_empty] = 0.0
+    return rgb
 
 
 def vec_to_rgb_hwc(vec: torch.Tensor, h: int, w: int, c: int) -> torch.Tensor:
@@ -239,6 +242,8 @@ def collect_direct_observer_pixel_sequences(
     device: torch.device,
     base_observer_mask: torch.Tensor,
     base_state_mask: torch.Tensor,
+    env_name: str,
+    img_shape: Tuple[int, int, int],
     graph,
     disable_messages: bool,
     permute_agent_positions: bool,
@@ -251,6 +256,7 @@ def collect_direct_observer_pixel_sequences(
             "Use an environment with rgb_array rendering."
         )
     states = torch.as_tensor(states_np, dtype=torch.float32, device=device)
+    states = preprocess_state_batch(states, env_name=env_name, img_shape=img_shape)
     actions = torch.as_tensor(actions_np, dtype=torch.float32, device=device)
     b, _, obs_dim = states.shape
     num_agents = base_observer_mask.shape[0]
@@ -346,6 +352,7 @@ def run_direct_pixel_eval(
     device: torch.device,
     base_observer_mask: torch.Tensor,
     base_state_mask: torch.Tensor,
+    env_name: str,
     graph,
     disable_messages: bool,
     permute_agent_positions: bool,
@@ -364,6 +371,8 @@ def run_direct_pixel_eval(
         device=device,
         base_observer_mask=base_observer_mask,
         base_state_mask=base_state_mask,
+        env_name=env_name,
+        img_shape=img_shape,
         graph=graph,
         disable_messages=disable_messages,
         permute_agent_positions=permute_agent_positions,
@@ -378,11 +387,17 @@ def run_direct_pixel_eval(
     baseline = true_obs.mean(dim=0, keepdim=True)
     baseline_mse = float(torch.mean((baseline.expand_as(true_obs) - true_obs) ** 2).item())
     sse = torch.sum((pred_obs - true_obs) ** 2)
-    sst = torch.sum((true_obs - true_obs.mean(dim=0, keepdim=True)) ** 2).clamp(min=1e-8)
-    r2 = float((1.0 - sse / sst).item())
+    sst = torch.sum((true_obs - true_obs.mean(dim=0, keepdim=True)) ** 2)
+    if float(sst.item()) < 1e-10:
+        r2 = float("nan")
+    else:
+        r2 = float((1.0 - sse / sst).item())
 
     true_frames_disp = ensure_rgb_frames_hwc(true_render)
-    pred_frames_disp = vec_to_rgb_hwc(pred_disp, h=h_obs, w=w_obs, c=c_obs)
+    if is_minigrid_symbolic_obs(env_name, img_shape):
+        pred_frames_disp = decode_minigrid_symbolic_vec_to_rgb_hwc(pred_disp, h=h_obs, w=w_obs)
+    else:
+        pred_frames_disp = vec_to_rgb_hwc(pred_disp, h=h_obs, w=w_obs, c=c_obs)
     pred_frames_disp = ensure_rgb_frames_hwc(pred_frames_disp)
     pred_frames_disp = resize_rgb_hwc(
         pred_frames_disp, out_h=int(true_frames_disp.shape[1]), out_w=int(true_frames_disp.shape[2])
@@ -410,6 +425,62 @@ def run_direct_pixel_eval(
         "pixel_direct/test_mse": mse,
         "pixel_direct/test_baseline_mse": baseline_mse,
         "pixel_direct/test_r2": r2,
+    }
+
+
+@torch.no_grad()
+def evaluate_model_with_preprocess(
+    model: DistributedGymWorldModel,
+    rollout: GymBatchRollout,
+    eval_batches: int,
+    seq_len: int,
+    device: torch.device,
+    base_observer_mask: torch.Tensor,
+    base_state_mask: torch.Tensor,
+    env_name: str,
+    img_shape: Tuple[int, int, int],
+    graph,
+    lambda_self: float,
+    lambda_neighbor: float,
+    blind_reg_weight: float,
+    disable_messages: bool,
+    permute_agent_positions: bool,
+) -> Dict[str, float]:
+    model.eval()
+    total = 0.0
+    self_total = 0.0
+    neighbor_total = 0.0
+    blind_total = 0.0
+
+    for _ in range(eval_batches):
+        states_np, actions_np, _ = rollout.sample_rollout(seq_len_plus_one=seq_len + 1)
+        states = torch.as_tensor(states_np, dtype=torch.float32, device=device)
+        states = preprocess_state_batch(states, env_name=env_name, img_shape=img_shape)
+        actions = torch.as_tensor(actions_np, dtype=torch.float32, device=device)
+        loss, self_loss, neighbor_loss, blind_loss = compute_sequence_loss(
+            model=model,
+            states=states,
+            actions=actions,
+            base_observer_mask=base_observer_mask,
+            base_state_mask=base_state_mask,
+            graph=graph,
+            lambda_self=lambda_self,
+            lambda_neighbor=lambda_neighbor,
+            blind_reg_weight=blind_reg_weight,
+            disable_messages=disable_messages,
+            permute_agent_positions=permute_agent_positions,
+        )
+        total += float(loss.item())
+        self_total += float(self_loss.item())
+        neighbor_total += float(neighbor_loss.item())
+        blind_total += float(blind_loss.item())
+
+    denom = float(max(1, eval_batches))
+    return {
+        "loss": total / denom,
+        "self_loss": self_total / denom,
+        "neighbor_loss": neighbor_total / denom,
+        "blind_reg_loss": blind_total / denom,
     }
 
 
@@ -453,7 +524,8 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--steps-per-epoch", type=int, default=40)
     parser.add_argument("--eval-batches", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--lambda-self", type=float, default=1.0)
     parser.add_argument("--lambda-neighbor", type=float, default=1.0)
     parser.add_argument("--blind-reg-weight", type=float, default=1e-3)
@@ -543,13 +615,6 @@ def main() -> None:
     )
     if int(base_observer_mask.sum().item()) == 0:
         raise ValueError("This variant requires at least one observer so full image can be partitioned across observers.")
-    #base_state_mask = build_image_patch_state_masks(
-    #    num_agents=args.agents,
-    #    img_shape=img_shape,
-    #    observer_mask=base_observer_mask,
-    #    seed=args.seed,
-    #    device=device,
-    #)
     base_state_mask = build_image_patch_state_masks_full_cover(
         num_agents=args.agents,
         img_shape=img_shape,
@@ -610,6 +675,7 @@ def main() -> None:
         for _ in range(args.steps_per_epoch):
             states_np, actions_np, _ = train_rollout.sample_rollout(seq_len_plus_one=args.seq_len + 1)
             states = torch.as_tensor(states_np, dtype=torch.float32, device=device)
+            states = preprocess_state_batch(states, env_name=args.env, img_shape=img_shape)
             actions = torch.as_tensor(actions_np, dtype=torch.float32, device=device)
             loss, self_loss, nbr_loss, blind_loss = compute_sequence_loss(
                 model=model,
@@ -626,13 +692,15 @@ def main() -> None:
             )
             optimizer.zero_grad()
             loss.backward()
+            if args.grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
             optimizer.step()
             train_total += float(loss.item())
             train_self += float(self_loss.item())
             train_nbr += float(nbr_loss.item())
             train_blind += float(blind_loss.item())
 
-        eval_metrics = evaluate_model(
+        eval_metrics = evaluate_model_with_preprocess(
             model=model,
             rollout=eval_rollout,
             eval_batches=args.eval_batches,
@@ -640,6 +708,8 @@ def main() -> None:
             device=device,
             base_observer_mask=base_observer_mask,
             base_state_mask=base_state_mask,
+            env_name=args.env,
+            img_shape=img_shape,
             graph=graph,
             lambda_self=args.lambda_self,
             lambda_neighbor=args.lambda_neighbor,
@@ -686,6 +756,7 @@ def main() -> None:
                 device=device,
                 base_observer_mask=base_observer_mask,
                 base_state_mask=base_state_mask,
+                env_name=args.env,
                 graph=graph,
                 disable_messages=args.disable_messages,
                 permute_agent_positions=args.permute_agent_positions,
