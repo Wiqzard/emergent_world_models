@@ -28,6 +28,46 @@ except Exception:
     import gym
 
 
+def ensure_env_registered(env_name: str) -> None:
+    try:
+        gym.spec(env_name)
+        return
+    except Exception as first_exc:
+        if env_name.startswith("MiniGrid-"):
+            try:
+                import minigrid  # noqa: F401
+            except Exception as import_exc:
+                raise RuntimeError(
+                    f"Environment {env_name} requires the `minigrid` package. "
+                    "Install it in the active environment first."
+                ) from import_exc
+            try:
+                gym.spec(env_name)
+                return
+            except Exception as second_exc:
+                raise RuntimeError(
+                    f"Environment {env_name} is still unavailable after importing minigrid."
+                ) from second_exc
+        raise first_exc
+
+
+def flatten_observation(obs) -> np.ndarray:
+    if isinstance(obs, dict):
+        if "image" in obs:
+            image = np.asarray(obs["image"], dtype=np.float32)
+            if image.size > 0 and image.max() > 1.0:
+                image = image / 255.0
+            return image.ravel()
+        parts = []
+        for key in sorted(obs.keys()):
+            value = np.asarray(obs[key], dtype=np.float32).ravel()
+            parts.append(value)
+        if parts:
+            return np.concatenate(parts, axis=0)
+        return np.zeros((0,), dtype=np.float32)
+    return np.asarray(obs, dtype=np.float32).ravel()
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -59,7 +99,7 @@ def env_reset(env, seed: Optional[int] = None) -> np.ndarray:
         obs = out[0]
     else:
         obs = out
-    return np.asarray(obs, dtype=np.float32).ravel()
+    return flatten_observation(obs)
 
 
 def env_step(env, action):
@@ -70,7 +110,7 @@ def env_step(env, action):
     else:
         obs, reward, done, info = out
         done = bool(done)
-    return np.asarray(obs, dtype=np.float32).ravel(), reward, done, info
+    return flatten_observation(obs), reward, done, info
 
 
 def get_action_dim(space) -> int:
@@ -220,6 +260,7 @@ class GymBatchRollout:
         self.batch_size = batch_size
         self.base_seed = seed
         self.render_mode = render_mode
+        ensure_env_registered(env_name)
         if frame_skip < 1:
             raise ValueError("frame_skip must be >= 1")
         self.frame_skip = int(frame_skip)
