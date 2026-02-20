@@ -60,6 +60,18 @@ def ensure_rgb_vectors(vec: torch.Tensor, h: int, w: int, c: int) -> torch.Tenso
     return frames.permute(0, 3, 1, 2).reshape(frames.shape[0], -1)
 
 
+def rescale_for_display(true_vec: torch.Tensor, pred_vec: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # MiniGrid observations are often small normalized symbolic values; auto-rescale for visibility.
+    flat = torch.cat([true_vec.reshape(-1), pred_vec.reshape(-1)], dim=0)
+    if flat.numel() == 0:
+        return true_vec, pred_vec
+    q99 = float(torch.quantile(flat, 0.99).item())
+    if q99 <= 0.0:
+        return true_vec, pred_vec
+    scale = 1.0 / q99 if q99 < 0.95 else 1.0
+    return torch.clamp(true_vec * scale, 0.0, 1.0), torch.clamp(pred_vec * scale, 0.0, 1.0)
+
+
 @torch.no_grad()
 def collect_direct_observer_pixel_sequences(
     model: DistributedGymWorldModel,
@@ -196,6 +208,7 @@ def run_direct_pixel_eval(
         permute_agent_positions=permute_agent_positions,
         video_env_index=video_env_index,
     )
+    true_disp, pred_disp = rescale_for_display(true_vec, pred_vec)
     mse = float(torch.mean((pred_vec - true_vec) ** 2).item())
     baseline = true_vec.mean(dim=0, keepdim=True)
     baseline_mse = float(torch.mean((baseline.expand_as(true_vec) - true_vec) ** 2).item())
@@ -204,11 +217,11 @@ def run_direct_pixel_eval(
     r2 = float((1.0 - sse / sst).item())
 
     h, w, c = img_shape
-    save_direct_pixel_plot(true_vec=true_vec, pred_vec=pred_vec, h=h, w=w, c=c, out_path=plot_path)
+    save_direct_pixel_plot(true_vec=true_disp, pred_vec=pred_disp, h=h, w=w, c=c, out_path=plot_path)
 
     if save_mp4:
-        true_rgb = ensure_rgb_vectors(true_vec, h=h, w=w, c=c)
-        pred_rgb = ensure_rgb_vectors(pred_vec, h=h, w=w, c=c)
+        true_rgb = ensure_rgb_vectors(true_disp, h=h, w=w, c=c)
+        pred_rgb = ensure_rgb_vectors(pred_disp, h=h, w=w, c=c)
         save_side_by_side_mp4(
             true_frames_vec=true_rgb,
             pred_frames_vec=pred_rgb,
