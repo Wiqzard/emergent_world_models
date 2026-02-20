@@ -424,6 +424,18 @@ def main() -> None:
     parser.add_argument("--graph-cols", type=int, default=4)
     parser.add_argument("--observer-frac", type=float, default=0.5)
     parser.add_argument("--observer-placement", type=str, default="cluster2d", choices=["auto", "random", "cluster2d"])
+    parser.add_argument(
+        "--minigrid-fully-obs",
+        dest="minigrid_fully_obs",
+        action="store_true",
+        help="For MiniGrid envs, use full-grid observation (16x16x3) instead of 7x7 partial view. Default: on.",
+    )
+    parser.add_argument(
+        "--no-minigrid-fully-obs",
+        dest="minigrid_fully_obs",
+        action="store_false",
+        help="Disable MiniGrid full-grid observation wrapping.",
+    )
     parser.add_argument("--observer-full-view", action="store_true", help="Observers see full local observation vector.")
     parser.add_argument(
         "--min-obs-dims",
@@ -473,6 +485,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--log-interval", type=int, default=5)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    parser.set_defaults(minigrid_fully_obs=True)
     args = parser.parse_args()
 
     if args.pixel_horizon < 1:
@@ -483,14 +496,27 @@ def main() -> None:
     set_seed(args.seed)
     device = resolve_device(args.device)
 
-    train_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 11, frame_skip=args.frame_skip)
-    eval_rollout = GymBatchRollout(args.env, args.batch_size, seed=args.seed + 17, frame_skip=args.frame_skip)
+    train_rollout = GymBatchRollout(
+        args.env,
+        args.batch_size,
+        seed=args.seed + 11,
+        frame_skip=args.frame_skip,
+        minigrid_fully_obs=args.minigrid_fully_obs,
+    )
+    eval_rollout = GymBatchRollout(
+        args.env,
+        args.batch_size,
+        seed=args.seed + 17,
+        frame_skip=args.frame_skip,
+        minigrid_fully_obs=args.minigrid_fully_obs,
+    )
     pixel_rollout = GymBatchRollout(
         args.env,
         args.batch_size,
         seed=args.seed + 23,
         frame_skip=args.frame_skip,
         render_mode="rgb_array",
+        minigrid_fully_obs=args.minigrid_fully_obs,
     )
 
     img_shape = infer_obs_image_shape_from_env(train_rollout.envs[0])

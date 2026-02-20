@@ -425,24 +425,39 @@ class GymBatchRollout:
         seed: int,
         render_mode: Optional[str] = None,
         frame_skip: int = 1,
+        minigrid_fully_obs: bool = False,
     ):
         self.env_name = env_name
         self.batch_size = batch_size
         self.base_seed = seed
         self.render_mode = render_mode
+        self.minigrid_fully_obs = bool(minigrid_fully_obs)
         ensure_env_registered(env_name)
         if frame_skip < 1:
             raise ValueError("frame_skip must be >= 1")
         self.frame_skip = int(frame_skip)
-        if render_mode is None:
-            self.envs = [gym.make(env_name) for _ in range(batch_size)]
-        else:
-            try:
-                self.envs = [gym.make(env_name, render_mode=render_mode) for _ in range(batch_size)]
-            except TypeError as exc:
-                raise RuntimeError(
-                    f"Environment {env_name} does not accept render_mode={render_mode}."
-                ) from exc
+
+        def _make_env():
+            if render_mode is None:
+                env = gym.make(env_name)
+            else:
+                try:
+                    env = gym.make(env_name, render_mode=render_mode)
+                except TypeError as exc:
+                    raise RuntimeError(
+                        f"Environment {env_name} does not accept render_mode={render_mode}."
+                    ) from exc
+            if self.minigrid_fully_obs and env_name.startswith("MiniGrid-"):
+                try:
+                    from minigrid.wrappers import FullyObsWrapper
+                except Exception as exc:
+                    raise RuntimeError(
+                        "minigrid_fully_obs=True requires minigrid wrappers to be available."
+                    ) from exc
+                env = FullyObsWrapper(env)
+            return env
+
+        self.envs = [_make_env() for _ in range(batch_size)]
         self.step_count = 0
 
         obs0 = env_reset(self.envs[0], seed=seed)

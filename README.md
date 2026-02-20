@@ -304,6 +304,7 @@ This variant keeps the same training setup but changes evaluation to use observe
   - next local observation prediction (`self` loss),
   - next-neighbor latent prediction (`neighbor` loss).
 - Observer input coverage: the full image observation is partitioned into disjoint spatial patches, with one patch per observer (e.g. 16 observers -> 16 patches), covering the whole image.
+- For MiniGrid in this variant, full-grid observation is enabled by default (`--minigrid-fully-obs`), so patches are split over the full `16x16x3` observation instead of the tiny `7x7x3` partial view.
 - Non-observer agents optimize:
   - next-neighbor latent prediction only.
 - Pixel evaluation:
