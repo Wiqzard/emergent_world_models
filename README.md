@@ -272,7 +272,8 @@ Useful flags:
 --pixel-plot-file outputs/gym_pixel_prediction_comparison.png
 --save-pixel-mp4
 --pixel-mp4-prefix outputs/gym_pixel_prediction
---pixel-video-fps 6
+--pixel-video-fps 3
+--pixel-videos-per-eval 2
 --pixel-video-env-index 0
 --pixel-eval-every 1
 --pixel-eval-train-batches 1
@@ -286,6 +287,7 @@ Sphere-style graph example with contiguous observer identities on the 2D sphere 
 python gym_distributed_local_world_model_experiment.py \
   --env MiniGrid-Dynamic-Obstacles-16x16-v0 \
   --pixel-probe --wandb --wandb-project emergent-world-models --frame-skip 1 --pixel-horizon 8 \
+--save-pixel-mp4 \
   --observer-frac 1.0 \
   --agents 32 \
   --graph sphere \

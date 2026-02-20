@@ -1194,6 +1194,33 @@ def append_tag_to_path(path: str, tag: str) -> str:
     return os.path.join(out_dir, tagged_name)
 
 
+def select_video_horizons(pixel_horizon: int, max_videos: int) -> List[int]:
+    if pixel_horizon < 1 or max_videos <= 0:
+        return []
+    if pixel_horizon <= max_videos:
+        return list(range(1, pixel_horizon + 1))
+    if max_videos == 1:
+        return [pixel_horizon]
+    if max_videos == 2:
+        return [1, pixel_horizon]
+
+    raw = np.linspace(1, pixel_horizon, num=max_videos)
+    picked: List[int] = []
+    for v in raw:
+        iv = int(round(float(v)))
+        iv = max(1, min(pixel_horizon, iv))
+        if iv not in picked:
+            picked.append(iv)
+    if 1 not in picked:
+        picked.insert(0, 1)
+    if pixel_horizon not in picked:
+        picked.append(pixel_horizon)
+    picked = sorted(set(picked))
+    while len(picked) > max_videos:
+        picked.pop(1 if len(picked) > 2 else -1)
+    return picked
+
+
 @torch.no_grad()
 def run_pixel_probe_snapshot(
     model: DistributedGymWorldModel,
@@ -1218,6 +1245,7 @@ def run_pixel_probe_snapshot(
     pixel_mp4_prefix: str,
     pixel_video_fps: int,
     pixel_video_env_index: int,
+    video_horizons: List[int],
 ) -> Dict[str, object]:
     pixel_train_sets = collect_pixel_probe_dataset_multi_h(
         model=model,
@@ -1286,7 +1314,7 @@ def run_pixel_probe_snapshot(
         plot_path = pixel_plot_file
 
     mp4_paths: Dict[int, str] = {}
-    if save_pixel_mp4:
+    if save_pixel_mp4 and video_horizons:
         horizon_videos = collect_pixel_video_sequences(
             model=model,
             rollout=pixel_probe_test_rollout,
@@ -1303,7 +1331,7 @@ def run_pixel_probe_snapshot(
             video_env_index=pixel_video_env_index,
             pixel_probe_weights=pixel_probe_weights,
         )
-        for h in range(1, pixel_horizon + 1):
+        for h in video_horizons:
             out_path = f"{pixel_mp4_prefix}_h{h}.mp4"
             true_h, pred_h = horizon_videos[h]
             save_side_by_side_mp4(
@@ -1416,7 +1444,8 @@ def main() -> None:
     parser.add_argument("--pixel-plot-file", type=str, default="outputs/gym_pixel_prediction_comparison.png")
     parser.add_argument("--save-pixel-mp4", action="store_true", help="Save horizon-wise true-vs-pred side-by-side MP4s.")
     parser.add_argument("--pixel-mp4-prefix", type=str, default="outputs/gym_pixel_prediction")
-    parser.add_argument("--pixel-video-fps", type=int, default=6)
+    parser.add_argument("--pixel-video-fps", type=int, default=3)
+    parser.add_argument("--pixel-videos-per-eval", type=int, default=2, help="How many horizon videos to save per eval snapshot.")
     parser.add_argument("--pixel-video-env-index", type=int, default=0)
     parser.add_argument("--pixel-eval-every", type=int, default=1, help="Run pixel visualization every N eval epochs.")
     parser.add_argument("--pixel-eval-train-batches", type=int, default=1)
@@ -1443,6 +1472,8 @@ def main() -> None:
         raise ValueError("--pixel-eval-every must be >= 1")
     if args.pixel_eval_train_batches < 1 or args.pixel_eval_test_batches < 1:
         raise ValueError("--pixel-eval-train-batches and --pixel-eval-test-batches must be >= 1")
+    if args.pixel_videos_per_eval < 0:
+        raise ValueError("--pixel-videos-per-eval must be >= 0")
     if args.save_pixel_mp4 and imageio_ffmpeg is None:
         raise RuntimeError(
             "--save-pixel-mp4 requested but imageio-ffmpeg is not installed. "
@@ -1543,6 +1574,9 @@ def main() -> None:
     if args.pixel_probe:
         print(f"Pixel probe horizon (macro-steps ahead): {args.pixel_horizon}")
         print(f"Save pixel MP4s: {args.save_pixel_mp4}")
+        if args.save_pixel_mp4:
+            print(f"Pixel video fps: {args.pixel_video_fps}")
+            print(f"Pixel videos per eval snapshot: {args.pixel_videos_per_eval}")
         print(f"Pixel visualization eval cadence: every {args.pixel_eval_every} epoch(s)")
     print(
         "Loss weights: "
@@ -1558,6 +1592,7 @@ def main() -> None:
         "train_nbr": [],
         "eval_loss": [],
     }
+    video_horizons_to_save = select_video_horizons(args.pixel_horizon, args.pixel_videos_per_eval)
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -1670,6 +1705,7 @@ def main() -> None:
                     pixel_mp4_prefix=eval_mp4_prefix,
                     pixel_video_fps=args.pixel_video_fps,
                     pixel_video_env_index=args.pixel_video_env_index,
+                    video_horizons=video_horizons_to_save,
                 )
                 metrics_h = eval_pixel["metrics"]
                 print(
@@ -1680,7 +1716,7 @@ def main() -> None:
                 if eval_pixel["plot_path"] is not None:
                     print(f"Saved eval pixel plot: {eval_pixel['plot_path']}")
                 if args.save_pixel_mp4:
-                    for h in range(1, args.pixel_horizon + 1):
+                    for h in sorted(eval_pixel["mp4_paths"].keys()):
                         path_h = eval_pixel["mp4_paths"].get(h)
                         if path_h is not None:
                             print(f"Saved eval pixel MP4 (h={h}): {path_h}")
@@ -1695,13 +1731,10 @@ def main() -> None:
                     if eval_pixel["plot_path"] is not None:
                         payload["eval_pixel/plot"] = wandb.Image(eval_pixel["plot_path"])
                     if args.save_pixel_mp4:
-                        for h in range(1, args.pixel_horizon + 1):
+                        for h in sorted(eval_pixel["mp4_paths"].keys()):
                             path_h = eval_pixel["mp4_paths"].get(h)
                             if path_h is not None:
-                                payload[f"eval_pixel/video_h{h}"] = wandb.Video(
-                                    path_h,
-                                    format="mp4",
-                                )
+                                payload[f"eval_pixel/video_h{h}"] = wandb.Video(path_h, format="mp4")
                     if payload:
                         payload["epoch"] = epoch
                         wandb.log(payload)
@@ -1865,7 +1898,7 @@ def main() -> None:
             pixel_plot_saved = True
             print(f"Saved pixel comparison: {args.pixel_plot_file}")
 
-        if args.save_pixel_mp4:
+        if args.save_pixel_mp4 and video_horizons_to_save:
             horizon_videos = collect_pixel_video_sequences(
                 model=model,
                 rollout=pixel_probe_test_rollout,
@@ -1882,7 +1915,7 @@ def main() -> None:
                 video_env_index=args.pixel_video_env_index,
                 pixel_probe_weights=pixel_probe_weights,
             )
-            for h in range(1, args.pixel_horizon + 1):
+            for h in video_horizons_to_save:
                 out_path = f"{args.pixel_mp4_prefix}_h{h}.mp4"
                 true_h, pred_h = horizon_videos[h]
                 save_side_by_side_mp4(
