@@ -1700,7 +1700,6 @@ def main() -> None:
                             if path_h is not None:
                                 payload[f"eval_pixel/video_h{h}"] = wandb.Video(
                                     path_h,
-                                    fps=max(1, int(args.pixel_video_fps)),
                                     format="mp4",
                                 )
                     if payload:
@@ -1930,7 +1929,7 @@ def main() -> None:
         if pixel_plot_saved:
             log_payload["plot/pixel_prediction"] = wandb.Image(args.pixel_plot_file)
         for idx, path in enumerate(pixel_mp4_paths, start=1):
-            log_payload[f"video/pixel_h{idx}"] = wandb.Video(path, fps=max(1, int(args.pixel_video_fps)), format="mp4")
+            log_payload[f"video/pixel_h{idx}"] = wandb.Video(path, format="mp4")
         wandb.log(log_payload)
         wandb_run.finish()
 
