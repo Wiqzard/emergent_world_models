@@ -16,6 +16,12 @@ Activate it (if your conda registry isn't writable, activate by path):
 conda activate emergent-multiagent
 ```
 
+If you already created the env before newer experiments were added, update dependencies:
+
+```bash
+conda env update -f environment.yml --prune
+```
+
 ## Run
 
 ```bash
@@ -172,4 +178,61 @@ Useful flags:
 --probe-train-batches 24
 --probe-test-batches 12
 --agent-probe-max-agents 0
+```
+
+## Gym Distributed World Model experiment (with random actions, visualization, and W&B)
+
+This variant uses a Gym environment (default: `Acrobot-v1`) and makes the signal flow explicit:
+
+- At each step, an action is sampled randomly from the environment action space.
+- Only observer agents receive:
+  - their assigned part of the current state (`--min-obs-dims` controls minimum visible dimensions),
+  - the sampled action vector.
+- Blind agents receive no direct state/action input and must rely on neighbor messages.
+- The model is still trained only with local objectives (self local next-state prediction + neighbor latent prediction).
+- After training, a frozen global probe predicts full next state from all agents' latents.
+
+Run:
+
+```bash
+python gym_distributed_local_world_model_experiment.py
+```
+
+W&B logging:
+
+```bash
+python gym_distributed_local_world_model_experiment.py --wandb --wandb-project emergent-world-models
+```
+
+Visualization:
+
+- Saves a metrics figure to `outputs/gym_world_model_metrics.png` by default (`--plot-file` to override).
+- The plot includes:
+  - train/eval loss curves,
+  - global probe test MSE vs baseline,
+  - observer-vs-blind single-agent probe MSE (if enabled).
+
+Useful flags:
+
+```bash
+--env Acrobot-v1
+--agents 32
+--graph ring|line
+--observer-frac 0.5
+--min-obs-dims 2
+--latent-dim 32
+--id-dim 8
+--batch-size 16
+--seq-len 10
+--epochs 50
+--steps-per-epoch 40
+--lambda-self 1.0
+--lambda-neighbor 1.0
+--blind-reg-weight 1e-3
+--disable-messages
+--permute-agent-positions
+--probe-train-batches 24
+--probe-test-batches 12
+--plot-file outputs/gym_world_model_metrics.png
+--wandb
 ```
