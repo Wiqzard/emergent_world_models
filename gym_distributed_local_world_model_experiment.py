@@ -23,9 +23,9 @@ except Exception:
     wandb = None
 
 try:
-    import imageio.v2 as imageio
+    import imageio_ffmpeg
 except Exception:
-    imageio = None
+    imageio_ffmpeg = None
 
 try:
     import gymnasium as gym
@@ -1155,10 +1155,10 @@ def save_side_by_side_mp4(
     output_path: str,
     fps: int,
 ) -> None:
-    if imageio is None:
+    if imageio_ffmpeg is None:
         raise RuntimeError(
-            "MP4 export requested but imageio is not installed. "
-            "Update env from environment.yml or install imageio and imageio-ffmpeg."
+            "MP4 export requires imageio-ffmpeg. "
+            "Update env from environment.yml."
         )
     out_dir = os.path.dirname(output_path)
     if out_dir:
@@ -1167,10 +1167,24 @@ def save_side_by_side_mp4(
     true_frames = frame_vectors_to_uint8(true_frames_vec, pixel_height, pixel_width)
     pred_frames = frame_vectors_to_uint8(pred_frames_vec, pixel_height, pixel_width)
     n = min(true_frames.shape[0], pred_frames.shape[0])
-    with imageio.get_writer(output_path, fps=max(1, int(fps)), codec="libx264", macro_block_size=1) as writer:
+    side0 = np.concatenate([true_frames[0], pred_frames[0]], axis=1)
+    height, width = int(side0.shape[0]), int(side0.shape[1])
+    writer = imageio_ffmpeg.write_frames(
+        output_path,
+        size=(width, height),
+        fps=max(1, int(fps)),
+        codec="libx264",
+        pix_fmt_in="rgb24",
+        pix_fmt_out="yuv420p",
+        macro_block_size=1,
+    )
+    writer.send(None)
+    try:
         for t in range(n):
             side = np.concatenate([true_frames[t], pred_frames[t]], axis=1)
-            writer.append_data(side)
+            writer.send(np.ascontiguousarray(side))
+    finally:
+        writer.close()
 
 
 def append_tag_to_path(path: str, tag: str) -> str:
@@ -1429,9 +1443,9 @@ def main() -> None:
         raise ValueError("--pixel-eval-every must be >= 1")
     if args.pixel_eval_train_batches < 1 or args.pixel_eval_test_batches < 1:
         raise ValueError("--pixel-eval-train-batches and --pixel-eval-test-batches must be >= 1")
-    if args.save_pixel_mp4 and imageio is None:
+    if args.save_pixel_mp4 and imageio_ffmpeg is None:
         raise RuntimeError(
-            "--save-pixel-mp4 requested but imageio is not installed. "
+            "--save-pixel-mp4 requested but imageio-ffmpeg is not installed. "
             "Update env from environment.yml."
         )
 
