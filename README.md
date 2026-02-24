@@ -199,6 +199,17 @@ Run:
 python distributed_patch_diffusion_experiment.py
 ```
 
+W&B logging + visualization:
+
+```bash
+python distributed_patch_diffusion_experiment.py --wandb --wandb-project emergent-world-models
+```
+
+When `--wandb` is enabled, the script logs:
+
+- Training/eval scalar metrics each logged eval epoch.
+- `eval/visual_panel` image (clean `x0`, noisy `x_t`, reconstructed `x_recon`, absolute error).
+
 Useful flags:
 
 ```bash
@@ -217,6 +228,11 @@ Useful flags:
 --steps-per-epoch 50
 --batch-size 16
 --device auto|cpu|cuda|mps
+--wandb
+--wandb-project emergent-world-models
+--wandb-run-name my-run
+--wandb-log-every 1
+--wandb-vis-every 5
 ```
 
 ## Gym Distributed World Model experiment (with random actions, visualization, and W&B)

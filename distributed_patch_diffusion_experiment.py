@@ -1,4 +1,5 @@
 import argparse
+import os
 import random
 from typing import Dict, Optional, Tuple
 
@@ -6,6 +7,19 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
+
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+
+try:
+    import wandb
+except Exception:
+    wandb = None
 
 
 def set_seed(seed: int) -> None:
@@ -280,6 +294,67 @@ def compute_step_loss(
     return loss, own_loss, neighbor_loss
 
 
+def tensor_to_image(x: torch.Tensor) -> np.ndarray:
+    # x is [1, H, W] in [-1, 1]
+    img = x.detach().cpu().clamp(-1.0, 1.0)
+    img = (img + 1.0) * 0.5
+    return img[0].numpy()
+
+
+def make_eval_visual_panel(x0: torch.Tensor, x_t: torch.Tensor, x_rec: torch.Tensor, t: int) -> Optional[np.ndarray]:
+    if plt is None:
+        return None
+    fig, axes = plt.subplots(1, 4, figsize=(10, 3))
+    titles = [f"x0 (clean)", f"x_t (t={t})", "x_recon", "abs error"]
+    imgs = [
+        tensor_to_image(x0),
+        tensor_to_image(x_t),
+        tensor_to_image(x_rec),
+        np.abs(tensor_to_image(x_rec) - tensor_to_image(x0)),
+    ]
+    vmins = [0.0, 0.0, 0.0, 0.0]
+    vmaxs = [1.0, 1.0, 1.0, 1.0]
+    for ax, title, img, vmin, vmax in zip(axes, titles, imgs, vmins, vmaxs):
+        ax.imshow(img, cmap="viridis", vmin=vmin, vmax=vmax)
+        ax.set_title(title)
+        ax.axis("off")
+    fig.tight_layout()
+    fig.canvas.draw()
+    w, h = fig.canvas.get_width_height()
+    panel = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)[..., :3]
+    plt.close(fig)
+    return panel
+
+
+def reconstruct_from_xt(
+    model: SharedLoRADiffusionModel,
+    x_t: torch.Tensor,
+    start_step: int,
+    num_steps: int,
+    neighbor_idx: torch.Tensor,
+    neighbor_mask: torch.Tensor,
+    agent_rows: int,
+    agent_cols: int,
+    patch_h: int,
+    patch_w: int,
+) -> torch.Tensor:
+    x = x_t
+    batch_size = x.shape[0]
+    for step in range(start_step, 0, -1):
+        timesteps = torch.full((batch_size,), step, dtype=torch.long, device=x.device)
+        patches = extract_agent_patches(x, agent_rows, agent_cols)
+        own_pred, _ = model(
+            noisy_patches=patches,
+            timesteps=timesteps,
+            neighbor_idx=neighbor_idx,
+            neighbor_mask=neighbor_mask,
+            num_steps=num_steps,
+        )
+        # Reconstruction rule from the prompt: x^{k-1} = cat_i x^{k-1}_i
+        x = stitch_agent_patches(own_pred, agent_rows, agent_cols, 1, patch_h, patch_w)
+    return x
+
+
 @torch.no_grad()
 def evaluate_model(
     model: SharedLoRADiffusionModel,
@@ -296,12 +371,14 @@ def evaluate_model(
     lambda_neighbor: float,
     device: torch.device,
     generator: Optional[torch.Generator],
-) -> Dict[str, float]:
+    return_visuals: bool = False,
+) -> Tuple[Dict[str, float], Optional[Dict[str, np.ndarray]]]:
     model.eval()
     loss_total = 0.0
     own_total = 0.0
     neighbor_total = 0.0
     recon_total = 0.0
+    visuals: Optional[Dict[str, np.ndarray]] = None
 
     patch_h = image_size // agent_rows
     patch_w = image_size // agent_cols
@@ -336,33 +413,38 @@ def evaluate_model(
         own_total += float(own_loss.item())
         neighbor_total += float(neighbor_loss.item())
 
-        x = q_sample(
+        x_t = q_sample(
             x0,
             torch.full((batch_size,), num_steps, dtype=torch.long, device=device),
             eps,
             alpha_bars,
         )
-        for step in range(num_steps, 0, -1):
-            timesteps = torch.full((batch_size,), step, dtype=torch.long, device=device)
-            patches = extract_agent_patches(x, agent_rows, agent_cols)
-            own_pred, _ = model(
-                noisy_patches=patches,
-                timesteps=timesteps,
-                neighbor_idx=neighbor_idx,
-                neighbor_mask=neighbor_mask,
-                num_steps=num_steps,
-            )
-            # Reconstruction rule from the prompt: x^{k-1} = cat_i x^{k-1}_i
-            x = stitch_agent_patches(own_pred, agent_rows, agent_cols, 1, patch_h, patch_w)
-        recon_total += float(F.mse_loss(x, x0).item())
+        x_rec = reconstruct_from_xt(
+            model=model,
+            x_t=x_t,
+            start_step=num_steps,
+            num_steps=num_steps,
+            neighbor_idx=neighbor_idx,
+            neighbor_mask=neighbor_mask,
+            agent_rows=agent_rows,
+            agent_cols=agent_cols,
+            patch_h=patch_h,
+            patch_w=patch_w,
+        )
+        recon_total += float(F.mse_loss(x_rec, x0).item())
+        if return_visuals and visuals is None:
+            panel = make_eval_visual_panel(x0[0], x_t[0], x_rec[0], num_steps)
+            if panel is not None:
+                visuals = {"eval_panel": panel}
 
     denom = float(max(1, eval_batches))
-    return {
+    metrics = {
         "loss": loss_total / denom,
         "own_loss": own_total / denom,
         "neighbor_loss": neighbor_total / denom,
         "recon_mse_from_xT": recon_total / denom,
     }
+    return metrics, visuals
 
 
 def main() -> None:
@@ -393,6 +475,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--log-interval", type=int, default=5)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default="emergent-world-models")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-log-every", type=int, default=1, help="Log scalar metrics to W&B every N eval epochs.")
+    parser.add_argument("--wandb-vis-every", type=int, default=5, help="Log eval visualization image to W&B every N eval epochs.")
     args = parser.parse_args()
 
     if args.image_size < 4:
@@ -433,6 +520,15 @@ def main() -> None:
         lora_alpha=args.lora_alpha,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    wandb_run = None
+    if args.wandb:
+        if wandb is None:
+            raise RuntimeError("wandb requested but package is not installed.")
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config=vars(args),
+        )
 
     print("Experiment: distributed_patch_diffusion_experiment.py")
     print(f"Device: {device}")
@@ -487,7 +583,8 @@ def main() -> None:
 
         if epoch % args.log_interval == 0 or epoch == 1 or epoch == args.epochs:
             denom = float(args.steps_per_epoch)
-            eval_metrics = evaluate_model(
+            should_log_vis = args.wandb and args.wandb_vis_every > 0 and (epoch % args.wandb_vis_every == 0 or epoch == 1 or epoch == args.epochs)
+            eval_metrics, eval_visuals = evaluate_model(
                 model=model,
                 eval_batches=args.eval_batches,
                 batch_size=args.batch_size,
@@ -502,6 +599,7 @@ def main() -> None:
                 lambda_neighbor=args.lambda_neighbor,
                 device=device,
                 generator=eval_gen,
+                return_visuals=should_log_vis,
             )
             print(
                 f"Epoch {epoch:4d} | "
@@ -511,7 +609,23 @@ def main() -> None:
                 f"(own={eval_metrics['own_loss']:.6f}, nbr={eval_metrics['neighbor_loss']:.6f}) | "
                 f"eval recon_mse_from_xT={eval_metrics['recon_mse_from_xT']:.6f}"
             )
+            if wandb_run is not None and args.wandb_log_every > 0 and (epoch % args.wandb_log_every == 0):
+                payload = {
+                    "epoch": epoch,
+                    "train/loss": train_loss / denom,
+                    "train/own_loss": train_own / denom,
+                    "train/neighbor_loss": train_neighbor / denom,
+                    "eval/loss": eval_metrics["loss"],
+                    "eval/own_loss": eval_metrics["own_loss"],
+                    "eval/neighbor_loss": eval_metrics["neighbor_loss"],
+                    "eval/recon_mse_from_xT": eval_metrics["recon_mse_from_xT"],
+                }
+                if eval_visuals is not None and "eval_panel" in eval_visuals:
+                    payload["eval/visual_panel"] = wandb.Image(eval_visuals["eval_panel"])
+                wandb.log(payload)
 
+    if wandb_run is not None:
+        wandb_run.finish()
     print("Done.")
 
 
