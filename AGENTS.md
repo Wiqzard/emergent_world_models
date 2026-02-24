@@ -35,6 +35,19 @@ This repo contains lightweight, reproducible experiments for emergent world mode
   - `bash scripts/submit_ubelix_emergent_world_model.sh`
   - This script auto-detects max allocatable GPU count (prefers `rtx4090`), creates/uses `emergent-multiagent`, and submits the world-model experiment job.
 
+Operational notes learned on UBELIX:
+- `sbatch --test-only` can still pass while real jobs remain pending due QoS limits. Check queue reason with:
+  - `squeue -u ss24i671 -o "%i %j %T %R"`
+  - If reason is `QOSMaxGRESPerUser`, reduce concurrent GPU jobs or wait.
+- Current account behavior observed: `rtx4090` submission succeeded with `--gpus-per-node=rtx4090:2` under QoS constraints.
+- For environment existence checks in submit scripts, prefer:
+  - `[[ -d "$HOME/.conda/envs/emergent-multiagent" ]]`
+  - This avoids false negatives seen with some `conda` command checks.
+- Always sync repo on UBELIX before submission:
+  - `git pull --ff-only`
+- Submitted job artifacts are written under:
+  - `~/Documents/emergent_world_models/outputs/ubelix_world_model`
+
 Reference flow:
 
 ```bash
