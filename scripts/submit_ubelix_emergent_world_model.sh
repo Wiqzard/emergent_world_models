@@ -60,7 +60,7 @@ echo "Using ${selected_type}:${selected_count}"
 
 module load Anaconda3
 eval "$(conda shell.bash hook)"
-if ! conda env list | awk '{print $1}' | grep -qx "$CONDA_ENV"; then
+if ! conda run -n "$CONDA_ENV" python -c "import sys" >/dev/null 2>&1; then
   conda env create -n "$CONDA_ENV" -f "$ROOT_DIR/environment.yml"
 fi
 if ! conda run -n "$CONDA_ENV" python -c "import minigrid" >/dev/null 2>&1; then
