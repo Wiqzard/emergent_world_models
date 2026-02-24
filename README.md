@@ -180,6 +180,45 @@ Useful flags:
 --agent-probe-max-agents 0
 ```
 
+## Shared-LoRA local diffusion patch experiment
+
+Additional experiment matching the local denoising setup:
+
+- Agents partition the image/grid into disjoint patches.
+- At diffusion step `k`, each agent receives `x^k_i` (its own noisy patch) plus `x^k_N(i)` from nearest neighbors.
+- The model uses shared weights across agents and per-agent identity adapters via LoRA.
+- Each agent predicts both:
+  - its own `x^{k-1}_i`,
+  - neighbor patches `x^{k-1}_N(i)` (auxiliary training target).
+- Global reconstruction follows your rule exactly:
+  - `x^{k-1} = cat_i x^{k-1}_i` (only stitched own-patch predictions are used).
+
+Run:
+
+```bash
+python distributed_patch_diffusion_experiment.py
+```
+
+Useful flags:
+
+```bash
+--image-size 16
+--agent-grid-rows 4
+--agent-grid-cols 4
+--num-diffusion-steps 20
+--beta-start 1e-4
+--beta-end 4e-2
+--hidden-dim 128
+--hidden-layers 2
+--lora-rank 4
+--lora-alpha 1.0
+--lambda-neighbor 1.0
+--epochs 30
+--steps-per-epoch 50
+--batch-size 16
+--device auto|cpu|cuda|mps
+```
+
 ## Gym Distributed World Model experiment (with random actions, visualization, and W&B)
 
 This variant uses a Gym environment (default: `Acrobot-v1`) and makes the signal flow explicit:
